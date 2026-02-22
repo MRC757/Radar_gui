@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env/
+
+# IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Application generated files (runtime config — do not commit)
+ais_encrypt_config.json
+radar_config.json
+nmea_config.json
+
+# Logs
+*.log
+*.jsonl
+
+# Distribution
+*.spec
+*.exe
+*.msi
