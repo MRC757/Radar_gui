@@ -7,6 +7,7 @@ Monitors GPS fix data for anomalies that indicate spoofing:
 """
 
 import math
+import time
 from datetime import datetime
 from enum import Enum
 
@@ -40,7 +41,7 @@ class GPSSpoofingDetector(QObject):
         self._prev_utc_seconds = None
         self._prev_lat = None
         self._prev_lon = None
-        self._prev_fix_time = None  # wall-clock datetime
+        self._prev_fix_time = None  # time.monotonic() of previous fix
 
         # Cooldown: { alert_type: last_alert_datetime }
         self._last_alert_times = {}
@@ -54,7 +55,8 @@ class GPSSpoofingDetector(QObject):
             lon: float -- longitude in decimal degrees
             speed_knots: float -- speed from VTG
         """
-        now = datetime.now()
+        now = datetime.now()          # for alert history / display
+        mono = time.monotonic()       # for elapsed time — immune to clock changes
 
         # --- Check 1: UTC time jump ---
         if utc_seconds is not None and self._prev_utc_seconds is not None:
@@ -86,7 +88,7 @@ class GPSSpoofingDetector(QObject):
         # --- Check 3: Position jump (implied speed) ---
         if (self._prev_lat is not None and self._prev_lon is not None
                 and self._prev_fix_time is not None):
-            elapsed = (now - self._prev_fix_time).total_seconds()
+            elapsed = mono - self._prev_fix_time
             if elapsed > 0.1:
                 distance_nm = self._haversine_nm(
                     self._prev_lat, self._prev_lon, lat, lon
@@ -105,7 +107,7 @@ class GPSSpoofingDetector(QObject):
             self._prev_utc_seconds = utc_seconds
         self._prev_lat = lat
         self._prev_lon = lon
-        self._prev_fix_time = now
+        self._prev_fix_time = mono
 
     @property
     def is_alert(self):

@@ -97,11 +97,13 @@ class CPACalculator:
         
         # If TCPA is negative, CPA is in the past
         if tcpa_seconds < 0:
-            # Already past CPA - threat is receding
+            # Already past CPA - threat is receding.  TCPA is reported as a
+            # NEGATIVE number (minutes since CPA) so displays and filters
+            # (e.g. "tcpa >= 0" = approaching) can tell it apart.
             current_distance = math.sqrt(rel_x**2 + rel_y**2) / 1852.0
             return CPAResult(
                 cpa_distance=current_distance,
-                tcpa_minutes=-tcpa_seconds / 60.0,  # Negative TCPA
+                tcpa_minutes=tcpa_seconds / 60.0,  # negative = CPA already passed
                 bearing_at_cpa=0,
                 range_at_cpa=current_distance,
                 relative_bearing=self._calculate_bearing(rel_x, rel_y),
@@ -225,32 +227,37 @@ class CPACalculator:
 
         return 'safe'
     
-    def calculate_bow_crossing_range(self, own_ship, target, cpa_result):
-        """
-        Calculate bow crossing range (BCR)
-        Distance at which target will cross own ship's bow
-        
+    def calculate_bow_crossing_range(self, own_ship, target, cpa_result=None):
+        """Bow crossing range (BCR).
+
+        Where the target will cross own ship's projected course line,
+        measured along that line from own ship (relative motion, constant
+        courses and speeds).
+
         Returns:
-            BCR in nautical miles, or None if no bow crossing
+            BCR in nautical miles — positive if the target crosses AHEAD,
+            negative if it crosses ASTERN — or None if it never crosses
+            (parallel relative motion, or the crossing is in the past).
         """
-        # Calculate relative bearing
-        rel_bearing = cpa_result.relative_bearing
-        
-        # Check if target is crossing bow (relative bearing 0-90 or 270-360)
-        if not (0 <= rel_bearing <= 90 or 270 <= rel_bearing <= 360):
+        rx, ry = self._latlon_to_meters(own_ship['lat'], own_ship['lon'],
+                                        target['lat'], target['lon'])
+        ovx, ovy = self._velocity_components(own_ship['course'], own_ship['speed'])
+        tvx, tvy = self._velocity_components(target['course'], target['speed'])
+        vx, vy = tvx - ovx, tvy - ovy
+
+        c = math.radians(own_ship['course'])
+        ux, uy = math.sin(c), math.cos(c)        # along own course
+        nx, ny = math.cos(c), -math.sin(c)       # perpendicular (starboard)
+
+        cross_pos = rx * nx + ry * ny            # target's offset from course line
+        cross_vel = vx * nx + vy * ny
+        if abs(cross_vel) < 1e-9:
             return None
-        
-        # Calculate intersection with own ship's course line
-        # This is a simplified calculation
-        # Full implementation would use vector intersection
-        
-        # For now, return approximate value based on geometry
-        if cpa_result.tcpa_minutes > 0:
-            # Distance own ship will travel to CPA
-            own_distance = own_ship['speed'] * (cpa_result.tcpa_minutes / 60.0)
-            return own_distance
-        
-        return None
+        t = -cross_pos / cross_vel
+        if t <= 0:
+            return None
+        along = (rx + vx * t) * ux + (ry + vy * t) * uy
+        return along / 1852.0
 
 
 def calculate_intercept(own_ship, target):
@@ -357,8 +364,9 @@ def calculate_intercept(own_ship, target):
 class ThreatAssessor:
     """Assess collision threats and generate alarms"""
     
-    def __init__(self):
-        self.cpa_calculator = CPACalculator()
+    def __init__(self, cpa_calculator=None):
+        # Share the caller's calculator so threshold changes apply everywhere
+        self.cpa_calculator = cpa_calculator or CPACalculator()
         self.active_threats = {}  # target_id -> threat_level
         
     def assess_target(self, target_id, own_ship, target):

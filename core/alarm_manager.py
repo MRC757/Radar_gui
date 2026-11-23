@@ -22,10 +22,12 @@ PC-speaker driver that winsound.Beep() targets.
 import io
 import logging
 import math
+import os
 import struct
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +130,8 @@ def _build_alarm_wavs():
         'gps_spoofing': lambda d: _make_warble(2200, 1400, d['dur']),
         'sensor_loss':  lambda d: _make_tone(d['freq'], d['dur']),
         'anchor_drag':  lambda d: _make_double_beep(d['freq'], d['dur']),
+        'radar_link':   lambda d: _make_warble(1300, 900, d['dur']),
+        'radar_video':  lambda d: _make_tone(d['freq'], d['dur']),
     }
     for atype, defn in ALARM_DEFS.items():
         builder = defs.get(atype)
@@ -149,6 +153,10 @@ ALARM_DEFS = {
                      'label': 'SENSOR LOSS'},
     'anchor_drag':  {'freq': 1000, 'dur': 400, 'interval': 3.0,
                      'label': 'ANCHOR DRAG'},
+    'radar_link':   {'freq': 1100, 'dur': 400, 'interval': 2.0,
+                     'label': 'RADAR LINK'},
+    'radar_video':  {'freq': 1100, 'dur': 300, 'interval': 2.0,
+                     'label': 'NO RADAR VIDEO'},
 }
 
 # Default descriptions when none is provided
@@ -159,6 +167,8 @@ _DEFAULT_DESCRIPTIONS = {
     'gps_spoofing': 'Position anomaly detected',
     'sensor_loss':  'Navigation data offline',
     'anchor_drag':  'Ship dragging anchor — outside swing radius',
+    'radar_link':   'Radar connection lost',
+    'radar_video':  'Transmitting but no radar video received',
 }
 
 # Pre-build WAV audio at module load
@@ -179,6 +189,9 @@ class AlarmEntry:
         self.active = True   # True while the condition persists
 
 
+_LOG_DIR = Path("logs")
+
+
 class AlarmManager:
     """Manages audible alarms with per-alarm silence and history.
 
@@ -186,6 +199,9 @@ class AlarmManager:
     condition clears (``clear()``) the entry becomes inactive.  If the
     condition re-occurs a **new** entry is created so it sounds and
     flashes again until the user acknowledges it.
+
+    All alarm events are appended to ``logs/alarm_log.txt`` for post-incident
+    review and IMO compliance.
     """
 
     MAX_ENTRIES = 20   # keep recent history
@@ -196,6 +212,14 @@ class AlarmManager:
         self._enabled = True
         self._lock = threading.Lock()
         self._cooldowns: dict[str, float] = {}   # alarm_type -> cooldown_end
+
+        # Persistent alarm log
+        try:
+            _LOG_DIR.mkdir(exist_ok=True)
+            self._log_path = _LOG_DIR / "alarm_log.txt"
+        except Exception:
+            self._log_path = None
+        self._write_log("STARTUP", "---", "Alarm manager initialized")
 
     # ------------------------------------------------------------------
     # Public API
@@ -226,9 +250,9 @@ class AlarmManager:
                 # --- New alarm condition ---
                 entry = AlarmEntry(alarm_type, description)
                 self._entries.insert(0, entry)
-                if len(self._entries) > self.MAX_ENTRIES:
-                    self._entries = self._entries[:self.MAX_ENTRIES]
+                self._trim_entries()
                 logger.info("Alarm raised: %s — %s", alarm_type, description)
+                self._write_log("TRIGGERED", alarm_type, description)
             else:
                 existing.description = description
                 entry = existing
@@ -253,6 +277,7 @@ class AlarmManager:
             if entry:
                 entry.silenced = True
                 logger.info("Alarm acknowledged: %s", alarm_type)
+                self._write_log("ACKNOWLEDGED", alarm_type, entry.description)
 
     def unsilence_type(self, alarm_type: str):
         """Un-silence the active entry for a specific alarm type."""
@@ -265,11 +290,13 @@ class AlarmManager:
         """Silence all alarms globally."""
         self._silenced_global = True
         logger.info("All alarms silenced")
+        self._write_log("SILENCED_ALL", "---", "Operator globally silenced all alarms")
 
     def unsilence(self):
         """Un-silence all alarms globally."""
         self._silenced_global = False
         logger.info("All alarms un-silenced")
+        self._write_log("UNSILENCED", "---", "Alarms globally un-silenced")
 
     @property
     def is_silenced(self):
@@ -295,6 +322,7 @@ class AlarmManager:
             entry = self._find_active_entry(alarm_type)
             if entry:
                 entry.active = False
+                self._write_log("CLEARED", alarm_type, entry.description)
 
     def clear_all(self):
         """Clear all active alarms."""
@@ -306,12 +334,48 @@ class AlarmManager:
     # Internal
     # ------------------------------------------------------------------
 
+    def _write_log(self, event: str, alarm_type: str, description: str):
+        """Append a single alarm event line to the persistent log file."""
+        if self._log_path is None:
+            return
+        try:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            line = f"{ts}  {event:<14}  {alarm_type:<16}  {description}\n"
+            with open(self._log_path, 'a', encoding='utf-8') as f:
+                f.write(line)
+        except Exception as exc:
+            logger.debug("Alarm log write failed: %s", exc)
+
+    def _trim_entries(self):
+        """Keep at most MAX_ENTRIES, dropping the oldest INACTIVE entries
+        first.  Active entries are never dropped — losing one would make the
+        next trigger() create a fresh, un-silenced duplicate."""
+        excess = len(self._entries) - self.MAX_ENTRIES
+        if excess <= 0:
+            return
+        for i in range(len(self._entries) - 1, -1, -1):
+            if excess == 0:
+                break
+            if not self._entries[i].active:
+                del self._entries[i]
+                excess -= 1
+
     def _find_active_entry(self, alarm_type: str):
         """Find the currently active entry for *alarm_type*, if any."""
         for entry in self._entries:
             if entry.alarm_type == alarm_type and entry.active:
                 return entry
         return None
+
+    def play_test_tone(self, alarm_type: str = 'sensor_loss'):
+        """Play an alarm tone directly for BIT audio testing.
+
+        Bypasses all silence, cooldown, and entry state — always plays
+        immediately so the operator can confirm audio output.
+        """
+        threading.Thread(
+            target=self._play, args=(alarm_type,), daemon=True
+        ).start()
 
     def _play(self, alarm_type: str):
         """Play the alarm tone through the default audio device."""

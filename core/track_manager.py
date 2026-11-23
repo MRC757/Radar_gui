@@ -6,6 +6,7 @@ Enhanced with CPA/TCPA calculation, Kalman filtering, and trail history
 
 import math
 import threading
+import time
 from collections import deque
 from datetime import datetime, timedelta
 from core.cpa_calculator import CPACalculator, ThreatAssessor
@@ -24,11 +25,20 @@ class TrackManager:
 
         # Correlation parameters
         self.correlation_distance_nm = 0.1  # Maximum distance for correlation
-        self.track_timeout = timedelta(minutes=5)  # Drop tracks after 5 minutes
+        # Timeouts in seconds, measured with time.monotonic() (immune to
+        # wall-clock changes).  AIS age comes from the parser's receive time,
+        # so a target that stops transmitting really does expire.
+        self.track_timeout = 360.0         # AIS: 6 min without a position report
+        # Radar tracks: the antenna revisits every few seconds, so a radar
+        # track that hasn't been reported for this long is lost.
+        self.radar_track_timeout = 60.0
+        self._filter_times = {}            # track_id -> monotonic time of last Kalman update
+        # Gate for associating ID-less radar plots with existing tracks
+        self.association_gate_nm = 0.15
 
         # CPA/TCPA calculation
         self.cpa_calculator = CPACalculator(cpa_threshold_nm=2.0, tcpa_threshold_min=12.0)
-        self.threat_assessor = ThreatAssessor()
+        self.threat_assessor = ThreatAssessor(self.cpa_calculator)   # shared thresholds
 
         # Guard zone management
         self.guard_zone_manager = GuardZoneManager()
@@ -47,12 +57,16 @@ class TrackManager:
         self.target_classifications = {}
 
         # Own ship data (needed for CPA/TCPA)
+        # Own ship data (needed for CPA/TCPA).  'course' is course over
+        # ground (falls back to heading); 'heading' orients relative zones.
         self.own_ship = {
             'lat': 0.0,
             'lon': 0.0,
             'course': 0.0,
-            'speed': 0.0
+            'speed': 0.0,
+            'heading': 0.0,
         }
+        self.own_position_valid = False
 
         # Priority-tiered correlation scheduling
         self._corr_tick: int = 0      # Monotonic counter; increments each correlate_tracks() call
@@ -64,14 +78,24 @@ class TrackManager:
         self.TIER_NEAR_NM: float = 3.0      # Correlate every 2nd tick
         # Tracks beyond TIER_NEAR_NM          correlate every 5th tick — lowest priority
 
-    def update_own_ship(self, lat, lon, course, speed):
-        """Update own ship position and motion"""
+    def update_own_ship(self, lat, lon, course, speed, heading=None):
+        """Update own ship position and motion.
+
+        Args:
+            course:  course over ground (deg true) — used for CPA
+            speed:   speed over ground (kts)
+            heading: true heading — used for bow-relative guard zones
+                     (defaults to course)
+        """
         self.own_ship = {
             'lat': lat,
             'lon': lon,
             'course': course,
-            'speed': speed
+            'speed': speed,
+            'heading': course if heading is None else heading,
         }
+        if lat or lon:
+            self.own_position_valid = True
 
     def set_target_classification(self, target_id, classification):
         """Set target classification: 'friendly', 'neutral', 'hostile', or None to clear."""
@@ -142,6 +166,7 @@ class TrackManager:
             self._update_radar_tracks_locked(radar_targets, current_time)
 
     def _update_radar_tracks_locked(self, radar_targets, current_time):
+        now_mono = time.monotonic()
         # Process nearest targets first so high-priority tracks are always
         # fully updated even if own-ship position is at the origin (0,0) on
         # startup — the sort is a no-op cost O(n log n) and negligible vs
@@ -153,32 +178,47 @@ class TrackManager:
                 t['lat'], t['lon']
             )
         )
+        claimed = set()
         for target in radar_targets:
             track_id = target.get('id', None)
-            
+
             if track_id is None:
-                # Create new track
-                track_id = self.generate_track_id('R')
-                
+                # No radar-supplied ID: associate with the nearest existing
+                # track inside the gate, otherwise start a new track.
+                track_id = self._associate_plot(target, claimed)
+            claimed.add(track_id)
+
             # Convert to meters for Kalman filter
             target_x, target_y = self._latlon_to_meters(
                 self.own_ship['lat'], self.own_ship['lon'],
                 target['lat'], target['lon']
             )
             
-            # Apply Kalman filtering
-            if track_id not in self.track_filters:
+            # Radar already filtered this target (SDK ARPA): trust its
+            # course/speed and skip our Kalman filter to avoid double-filtering.
+            radar_filtered = bool(target.get('filtered')
+                                  and target.get('course') is not None
+                                  and target.get('speed') is not None)
+            if radar_filtered:
+                filtered_x, filtered_y = target_x, target_y
+                filtered_course = float(target['course']) % 360.0
+                filtered_speed = float(target['speed'])
+            # Otherwise apply Kalman filtering
+            elif track_id not in self.track_filters:
                 # Initialize new filter
                 self.track_filters[track_id] = KalmanTrackFilter()
                 self.track_filters[track_id].initialize(target_x, target_y)
                 filtered_x, filtered_y = target_x, target_y
             else:
-                # Predict and update
-                self.track_filters[track_id].predict()
+                # Predict over the REAL elapsed time, then update
+                dt = now_mono - self._filter_times.get(track_id, now_mono - 1.0)
+                self.track_filters[track_id].predict(max(dt, 1e-3))
                 filtered_x, filtered_y = self.track_filters[track_id].update([target_x, target_y])
-            
-            # Get filtered course and speed
-            filtered_speed, filtered_course = self.track_filters[track_id].get_speed_and_course()
+            if not radar_filtered:
+                self._filter_times[track_id] = now_mono
+
+            if not radar_filtered:
+                filtered_speed, filtered_course = self.track_filters[track_id].get_speed_and_course()
             
             # Convert back to lat/lon
             filtered_lat, filtered_lon = self._meters_to_latlon(
@@ -194,15 +234,15 @@ class TrackManager:
                 'speed': filtered_speed
             }
             
-            cpa_result = self.cpa_calculator.calculate(self.own_ship, target_data)
             threat_assessment = self.threat_assessor.assess_target(track_id, self.own_ship, target_data)
-            
+
             # Check guard zones
             bearing, range_nm = calculate_target_bearing_range(
                 self.own_ship['lat'], self.own_ship['lon'],
                 filtered_lat, filtered_lon
             )
-            guard_zones = self.guard_zone_manager.check_target(track_id, bearing, range_nm)
+            guard_zones = self.guard_zone_manager.check_target(
+                track_id, bearing, range_nm, self.own_ship['heading'])
             
             # Record trail position
             self._record_trail(track_id, filtered_lat, filtered_lon, current_time)
@@ -214,10 +254,11 @@ class TrackManager:
                 'lon': filtered_lon,
                 'course': filtered_course,
                 'speed': filtered_speed,
-                'last_update': current_time,
+                'course_valid': True,
+                'last_update': now_mono,
                 'type': 'radar',
-                'cpa': cpa_result.cpa_distance,
-                'tcpa': cpa_result.tcpa_minutes,
+                'cpa': threat_assessment['cpa'],
+                'tcpa': threat_assessment['tcpa'],
                 'risk_level': threat_assessment['risk_level'],
                 'is_threat': threat_assessment['is_threat'],
                 'guard_zones': guard_zones,
@@ -228,7 +269,8 @@ class TrackManager:
             }
             
         # Remove old tracks
-        self.cleanup_old_tracks(self.radar_tracks, current_time)
+        self.cleanup_old_tracks(self.radar_tracks, now_mono,
+                                timeout=self.radar_track_timeout)
         
         # Attempt correlation
         self.correlate_tracks()
@@ -275,56 +317,76 @@ class TrackManager:
                 t['lat'], t['lon']
             )
         )
+        now_mono = time.monotonic()
         for target in ais_targets:
             mmsi = target.get('mmsi')
-            if mmsi:
-                # Calculate CPA/TCPA
-                target_data = {
-                    'lat': target['lat'],
-                    'lon': target['lon'],
-                    'course': target.get('course', 0),
-                    'speed': target.get('speed', 0)
-                }
-                
-                cpa_result = self.cpa_calculator.calculate(self.own_ship, target_data)
-                threat_assessment = self.threat_assessor.assess_target(mmsi, self.own_ship, target_data)
-                
-                # Check guard zones
-                bearing, range_nm = calculate_target_bearing_range(
-                    self.own_ship['lat'], self.own_ship['lon'],
-                    target['lat'], target['lon']
-                )
-                guard_zones = self.guard_zone_manager.check_target(mmsi, bearing, range_nm)
-                
-                # Record trail position
-                self._record_trail(mmsi, target['lat'], target['lon'], current_time)
+            if not mmsi:
+                continue
+            course = target.get('course')
+            speed = target.get('speed')
+            # SOG/COG "not available" -> no CPA (never assume 0 / due north)
+            motion_valid = course is not None and speed is not None
+            if motion_valid and self.own_position_valid:
+                threat_assessment = self.threat_assessor.assess_target(mmsi, self.own_ship, {
+                    'lat': target['lat'], 'lon': target['lon'],
+                    'course': course, 'speed': speed,
+                })
+                cpa, tcpa = threat_assessment['cpa'], threat_assessment['tcpa']
+                risk, is_threat = threat_assessment['risk_level'], threat_assessment['is_threat']
+            else:
+                self.threat_assessor.active_threats.pop(mmsi, None)
+                cpa = tcpa = None
+                risk, is_threat = 'safe', False
 
-                self.ais_tracks[mmsi] = {
-                    'id': mmsi,
-                    'mmsi': mmsi,
-                    'lat': target['lat'],
-                    'lon': target['lon'],
-                    'course': target.get('course', 0),
-                    'speed': target.get('speed', 0),
-                    'name': target.get('name', f'Unknown-{mmsi}'),
-                    'last_update': current_time,
-                    'type': 'ais',
-                    'cpa': cpa_result.cpa_distance,
-                    'tcpa': cpa_result.tcpa_minutes,
-                    'risk_level': threat_assessment['risk_level'],
-                    'is_threat': threat_assessment['is_threat'],
-                    'guard_zones': guard_zones,
-                    'bearing': bearing,
-                    'range': range_nm,
-                    'trail': self._get_trail(mmsi),
-                    'classification': self.target_classifications.get(mmsi)
-                                     or ('friendly' if target.get('encrypted') else None),
-                    'encrypted': target.get('encrypted', False),
-                    'decrypt_key': target.get('decrypt_key', ''),
-                }
-                
+            # Check guard zones
+            bearing, range_nm = calculate_target_bearing_range(
+                self.own_ship['lat'], self.own_ship['lon'],
+                target['lat'], target['lon']
+            )
+            guard_zones = self.guard_zone_manager.check_target(
+                mmsi, bearing, range_nm, self.own_ship['heading'])
+
+            # Record trail position
+            self._record_trail(mmsi, target['lat'], target['lon'], current_time)
+
+            self.ais_tracks[mmsi] = {
+                'id': mmsi,
+                'mmsi': mmsi,
+                'lat': target['lat'],
+                'lon': target['lon'],
+                'course': course if course is not None else 0.0,
+                'speed': speed if speed is not None else 0.0,
+                'course_valid': course is not None,
+                'speed_valid': speed is not None,
+                'name': target.get('name', f'Unknown-{mmsi}'),
+                # Age of the last REAL position report, from the parser
+                'last_update': target.get('rx_time', now_mono),
+                'type': 'ais',
+                'cpa': cpa,
+                'tcpa': tcpa,
+                'risk_level': risk,
+                'is_threat': is_threat,
+                'guard_zones': guard_zones,
+                'bearing': bearing,
+                'range': range_nm,
+                'trail': self._get_trail(mmsi),
+                # Targets decrypted with a configured key are classified
+                # friendly automatically.  An operator classification
+                # (right-click menu) always takes precedence.  Note: AES-CBC
+                # does not authenticate the sender — see README.
+                'classification': self.target_classifications.get(mmsi)
+                                  or ('friendly' if target.get('encrypted') else None),
+                'encrypted': target.get('encrypted', False),
+                'decrypt_key': target.get('decrypt_key', ''),
+            }
+
+        # Targets the parser dropped (lost) are removed here too
+        present = {t.get('mmsi') for t in ais_targets}
+        for mmsi in [m for m in self.ais_tracks if m not in present]:
+            self._drop_track(self.ais_tracks, mmsi)
+
         # Remove old tracks
-        self.cleanup_old_tracks(self.ais_tracks, current_time)
+        self.cleanup_old_tracks(self.ais_tracks, now_mono)
         
         # Attempt correlation
         self.correlate_tracks()
@@ -468,19 +530,43 @@ class TrackManager:
 
         self.correlated_tracks = new_corr
                 
-    def cleanup_old_tracks(self, track_dict, current_time):
-        """Remove tracks that haven't been updated recently"""
-        to_remove = []
-        for track_id, track in track_dict.items():
-            if current_time - track['last_update'] > self.track_timeout:
-                to_remove.append(track_id)
+    def _associate_plot(self, target, claimed):
+        """Return the ID of the nearest unclaimed radar track within the
+        association gate, or a new track ID."""
+        best_id, best_d = None, self.association_gate_nm
+        for tid, trk in self.radar_tracks.items():
+            if tid in claimed:
+                continue
+            d = self.calculate_distance(trk['lat'], trk['lon'], target['lat'], target['lon'])
+            if d <= best_d:
+                best_id, best_d = tid, d
+        return best_id if best_id is not None else self.generate_track_id('R')
 
+    def _drop_track(self, track_dict, track_id):
+        """Remove a track and ALL state that refers to it — including guard
+        zone intrusions and active threats, so their alarms can clear."""
+        track_dict.pop(track_id, None)
+        self.track_history.pop(track_id, None)
+        self._last_trail_record.pop(track_id, None)
+        self.track_filters.pop(track_id, None)
+        self._filter_times.pop(track_id, None)
+        self.correlated_tracks.pop(track_id, None)
+        self.guard_zone_manager.clear_target(track_id)
+        self.threat_assessor.active_threats.pop(track_id, None)
+
+    def remove_radar_track(self, track_id):
+        """Drop a radar track (e.g. operator cancelled it)."""
+        with self._lock:
+            self._drop_track(self.radar_tracks, track_id)
+            self.target_classifications.pop(track_id, None)
+
+    def cleanup_old_tracks(self, track_dict, now_mono, timeout=None):
+        """Remove tracks not updated within timeout seconds (monotonic clock)."""
+        timeout = timeout or self.track_timeout
+        to_remove = [tid for tid, track in track_dict.items()
+                     if now_mono - track['last_update'] > timeout]
         for track_id in to_remove:
-            del track_dict[track_id]
-            # Clean up trail history and filters for expired tracks
-            self.track_history.pop(track_id, None)
-            self._last_trail_record.pop(track_id, None)
-            self.track_filters.pop(track_id, None)
+            self._drop_track(track_dict, track_id)
             
     def get_radar_tracks(self):
         """Get list of radar tracks (snapshot copy, thread-safe)."""

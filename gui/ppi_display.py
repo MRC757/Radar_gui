@@ -5,14 +5,17 @@ orientation modes, target selection, trails, and guard zones.
 """
 
 import math
+import time
 from enum import Enum, auto
 
 import numpy as np
 from PyQt6.QtWidgets import QWidget
-from PyQt6.QtCore import Qt, QTimer, QPointF, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, pyqtSignal
 from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QPainterPath
 
 from gui.color_themes import DisplayMode, get_theme
+from gui.radar_video import RadarVideoBuffer
+from gui.formatting import fmt, fmt_tcpa
 
 
 class OrientationMode(Enum):
@@ -74,9 +77,11 @@ class PPIDisplayWidget(QWidget):
         self.true_motion_ref_lon = None
         self.true_motion_reset_fraction = 0.75
 
-        # Radar data
-        self.radar_data = None
+        # Radar video (spoke buffer) — sweep angle follows the latest spoke
+        self.video = RadarVideoBuffer()
+        self.video.set_colors(self.theme.radar_echo_weak, self.theme.radar_echo_strong)
         self.radar_sweep_angle = 0.0
+        self._last_spoke_time = None
 
         # Track data
         self.radar_tracks = []
@@ -127,11 +132,6 @@ class PPIDisplayWidget(QWidget):
         self.flash_timer.timeout.connect(self._toggle_flash)
         self.flash_timer.start(500)
 
-        # Sweep animation
-        self.sweep_timer = QTimer()
-        self.sweep_timer.timeout.connect(self.update_sweep)
-        self.sweep_timer.start(50)
-
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -144,6 +144,7 @@ class PPIDisplayWidget(QWidget):
     def set_display_mode(self, mode: DisplayMode):
         self.display_mode = mode
         self.theme = get_theme(mode)
+        self.video.set_colors(self.theme.radar_echo_weak, self.theme.radar_echo_strong)
         self.update()
 
     def set_orientation_mode(self, mode: OrientationMode):
@@ -155,6 +156,7 @@ class PPIDisplayWidget(QWidget):
 
     def set_range(self, range_nm):
         self.range_nm = range_nm
+        self.video.set_range(range_nm)
         self.update()
 
     def set_video_mode(self, mode):
@@ -211,15 +213,20 @@ class PPIDisplayWidget(QWidget):
         return list(self.range_ring_distances)
 
     def _screen_dist_from_center(self, sx, sy):
-        """Pixel distance from PPI center."""
+        """Pixel distance from PPI center (range rings are centred here)."""
         dx = sx - self.center_x
         dy = sy - self.center_y
         return math.sqrt(dx * dx + dy * dy)
 
+    def _screen_dist_from_own_ship(self, sx, sy):
+        """Pixel distance from own ship (VRMs are centred on own ship)."""
+        ox, oy = self._own_ship_screen_pos()
+        return math.hypot(sx - ox, sy - oy)
+
     def _hit_test_ebl(self, sx, sy):
         """Return 'ebl1', 'ebl2', or None if cursor is near a visible EBL."""
         bearing, _ = self.screen_to_bearing_range(sx, sy)
-        dist_from_center = self._screen_dist_from_center(sx, sy)
+        dist_from_center = self._screen_dist_from_own_ship(sx, sy)
         if dist_from_center < 20:
             return None  # too close to center, ambiguous
         for name, brg, vis in [('ebl1', self.ebl1_bearing, self.ebl1_visible),
@@ -235,7 +242,7 @@ class PPIDisplayWidget(QWidget):
 
     def _hit_test_vrm(self, sx, sy):
         """Return 'vrm1', 'vrm2', or None if cursor is near a visible VRM."""
-        cursor_dist = self._screen_dist_from_center(sx, sy)
+        cursor_dist = self._screen_dist_from_own_ship(sx, sy)
         for name, rng, vis in [('vrm1', self.vrm1_range, self.vrm1_visible),
                                 ('vrm2', self.vrm2_range, self.vrm2_visible)]:
             if not vis:
@@ -301,9 +308,28 @@ class PPIDisplayWidget(QWidget):
         self.own_heading = heading
         self.update()
 
-    def update_radar_data(self, radar_data):
-        self.radar_data = radar_data
+    def configure_video(self, spokes_per_revolution, samples_per_spoke):
+        """Match the video buffer to the connected radar's resolution."""
+        self.video.configure(spokes_per_revolution, min(samples_per_spoke, 1024))
+        self.video.set_range(self.range_nm)
+
+    def add_spokes(self, spokes):
+        """Receive a batch of core.radar.Spoke objects from the radar driver."""
+        self.video.add_spokes(spokes, self.own_heading)
+        if self.video.last_true_azimuth is not None:
+            self.radar_sweep_angle = self.video.last_true_azimuth
+        self._last_spoke_time = time.monotonic()
         self.update()
+
+    def clear_video(self):
+        """Blank the radar picture (standby / disconnect / radar change)."""
+        self.video.clear()
+        self._last_spoke_time = None
+        self.update()
+
+    def _video_active(self):
+        return (self._last_spoke_time is not None
+                and time.monotonic() - self._last_spoke_time < 2.0)
 
     def update_tracks(self, radar_tracks, ais_tracks):
         self.radar_tracks = radar_tracks
@@ -317,10 +343,6 @@ class PPIDisplayWidget(QWidget):
     # ------------------------------------------------------------------
     # Timers
     # ------------------------------------------------------------------
-
-    def update_sweep(self):
-        self.radar_sweep_angle = (self.radar_sweep_angle + 3.0) % 360
-        self.update()
 
     def _toggle_flash(self):
         self.flash_state = not self.flash_state
@@ -372,15 +394,18 @@ class PPIDisplayWidget(QWidget):
         range_fraction = range_nm / self.range_nm if self.range_nm > 0 else 0
         screen_range = range_fraction * self.radius
 
+        # Origin is OWN SHIP (differs from the screen centre in True Motion)
+        ox, oy = self._own_ship_screen_pos()
         adjusted_azimuth = azimuth + self._get_rotation_angle()
         rad = math.radians(adjusted_azimuth)
-        x = self.center_x + screen_range * math.sin(rad)
-        y = self.center_y - screen_range * math.cos(rad)
+        x = ox + screen_range * math.sin(rad)
+        y = oy - screen_range * math.cos(rad)
         return x, y
 
     def screen_to_bearing_range(self, sx, sy):
-        dx = sx - self.center_x
-        dy = -(sy - self.center_y)
+        ox, oy = self._own_ship_screen_pos()     # bearing/range FROM OWN SHIP
+        dx = sx - ox
+        dy = -(sy - oy)
         bearing = (math.degrees(math.atan2(dx, dy)) - self._get_rotation_angle()) % 360
         pixel_range = math.sqrt(dx ** 2 + dy ** 2)
         range_nm = (pixel_range / self.radius) * self.range_nm if self.radius > 0 else 0
@@ -389,7 +414,7 @@ class PPIDisplayWidget(QWidget):
     def screen_to_latlon(self, sx, sy):
         """Convert screen coordinates to latitude/longitude."""
         bearing, range_nm = self.screen_to_bearing_range(sx, sy)
-        ref_lat, ref_lon = self._get_display_center()
+        ref_lat, ref_lon = self.own_lat, self.own_lon   # bearing/range are from own ship
         rad = math.radians(bearing)
         delta_lat = range_nm * math.cos(rad)  # NM north
         cos_lat = math.cos(math.radians(ref_lat)) if ref_lat != 0 else 1.0
@@ -485,7 +510,7 @@ class PPIDisplayWidget(QWidget):
             return
 
         if self._vrm_drag:
-            cursor_dist_px = self._screen_dist_from_center(sx, sy)
+            cursor_dist_px = self._screen_dist_from_own_ship(sx, sy)
             new_nm = (cursor_dist_px / self.radius) * self.range_nm if self.radius > 0 else 0
             new_nm = max(0.01, min(new_nm, self.range_nm))
             if self._vrm_drag == 'vrm1':
@@ -595,10 +620,10 @@ class PPIDisplayWidget(QWidget):
 
         self.draw_grid(painter)
 
-        if self.radar_data:
-            self.draw_radar_video(painter)
+        self.draw_radar_video(painter)
 
-        self.draw_sweep(painter)
+        if self._video_active():
+            self.draw_sweep(painter)
 
         if self.show_guard_zones:
             self.draw_guard_zones(painter)
@@ -673,29 +698,37 @@ class PPIDisplayWidget(QWidget):
             ty = self.center_y - (self.radius + 15) * math.cos(rad)
             painter.drawText(int(tx - 12), int(ty + 5), f"{angle:03d}")
 
+    def _own_ship_screen_pos(self):
+        if self.orientation_mode == OrientationMode.TRUE_MOTION:
+            return self.latlon_to_screen(self.own_lat, self.own_lon)
+        return float(self.center_x), float(self.center_y)
+
     def draw_radar_video(self, painter):
-        if not self.radar_data or 'video' not in self.radar_data:
+        if self.radius <= 0:
             return
-        for ret in self.radar_data['video']:
-            x, y = self.polar_to_screen(ret['azimuth'], ret['range'])
-            intensity = ret['intensity']
-            if intensity > 0.6:
-                color = QColor(self.theme.radar_echo_strong)
-                color.setAlpha(int(150 + intensity * 105))
-            else:
-                color = QColor(self.theme.radar_echo_weak)
-                color.setAlpha(int(80 + intensity * 175))
-            point_size = 1 if intensity < 0.5 else 2
-            painter.setPen(QPen(color, point_size))
-            painter.drawPoint(int(x), int(y))
+        image = self.video.render(2 * self.radius)
+        if image is None:
+            return
+        ox, oy = self._own_ship_screen_pos()
+        painter.save()
+        clip = QPainterPath()
+        clip.addEllipse(QPointF(self.center_x, self.center_y), self.radius, self.radius)
+        painter.setClipPath(clip)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.translate(ox, oy)
+        painter.rotate(self._get_rotation_angle())
+        r = self.radius
+        painter.drawImage(QRectF(-r, -r, 2 * r, 2 * r), image)
+        painter.restore()
 
     def draw_sweep(self, painter):
         painter.setPen(QPen(self.theme.sweep_line, 2))
         rotation = self._get_rotation_angle()
         rad = math.radians(self.radar_sweep_angle + rotation)
-        x = self.center_x + self.radius * math.sin(rad)
-        y = self.center_y - self.radius * math.cos(rad)
-        painter.drawLine(self.center_x, self.center_y, int(x), int(y))
+        ox, oy = self._own_ship_screen_pos()
+        x = ox + self.radius * math.sin(rad)
+        y = oy - self.radius * math.cos(rad)
+        painter.drawLine(QPointF(ox, oy), QPointF(x, y))
 
     def draw_guard_zones(self, painter):
         for zone in self.guard_zones:
@@ -710,7 +743,7 @@ class PPIDisplayWidget(QWidget):
                 boundary_color = self.theme.guard_zone_boundary
                 fill_color = self.theme.guard_zone_fill
 
-            points = zone.get_boundary_points(num_points=60)
+            points = zone.get_boundary_points(num_points=60, own_heading=self.own_heading)
             path = QPainterPath()
             first = True
             for bearing, range_nm in points:
@@ -859,7 +892,8 @@ class PPIDisplayWidget(QWidget):
             path.closeSubpath()
             painter.drawPath(path)
 
-            if ais.get('speed', 0) > 0.5:
+            # No vector when COG is "not available" (it would point due north)
+            if ais.get('speed', 0) > 0.5 and ais.get('course_valid', True):
                 self.draw_vector(painter, x, y, ais.get('course', 0),
                                  ais['speed'] * 3, color)
 
@@ -1058,8 +1092,9 @@ class PPIDisplayWidget(QWidget):
     def draw_ebl_vrm(self, painter):
         """Draw Electronic Bearing Lines and Variable Range Markers."""
         rotation = self._get_rotation_angle()
+        ox, oy = self._own_ship_screen_pos()
 
-        # EBLs — dashed lines from center to edge at the given bearing
+        # EBLs — dashed lines from own ship to edge at the given bearing
         for brg, vis, label in [(self.ebl1_bearing, self.ebl1_visible, "EBL1"),
                                  (self.ebl2_bearing, self.ebl2_visible, "EBL2")]:
             if not vis:
@@ -1067,12 +1102,12 @@ class PPIDisplayWidget(QWidget):
             pen = QPen(self.theme.ebl_line, 1, Qt.PenStyle.DashLine)
             painter.setPen(pen)
             rad = math.radians(brg + rotation)
-            x = self.center_x + self.radius * math.sin(rad)
-            y = self.center_y - self.radius * math.cos(rad)
-            painter.drawLine(self.center_x, self.center_y, int(x), int(y))
+            x = ox + self.radius * math.sin(rad)
+            y = oy - self.radius * math.cos(rad)
+            painter.drawLine(QPointF(ox, oy), QPointF(x, y))
             # Label at 80% of radius
-            lx = self.center_x + self.radius * 0.82 * math.sin(rad)
-            ly = self.center_y - self.radius * 0.82 * math.cos(rad)
+            lx = ox + self.radius * 0.82 * math.sin(rad)
+            ly = oy - self.radius * 0.82 * math.cos(rad)
             painter.setFont(QFont('Consolas', 8, QFont.Weight.Bold))
             painter.drawText(int(lx) + 4, int(ly) - 4,
                              f"{label} {brg:05.1f}\u00b0")
@@ -1086,11 +1121,11 @@ class PPIDisplayWidget(QWidget):
             painter.setPen(pen)
             r = self.radius * (rng / self.range_nm) if self.range_nm > 0 else 0
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawEllipse(QPointF(self.center_x, self.center_y), r, r)
+            painter.drawEllipse(QPointF(ox, oy), r, r)
             # Label at right side
             painter.setFont(QFont('Consolas', 8, QFont.Weight.Bold))
-            painter.drawText(int(self.center_x + r + 4),
-                             self.center_y + 4,
+            painter.drawText(int(ox + r + 4),
+                             int(oy + 4),
                              f"{label} {rng:.2f}NM")
 
     def draw_cursor_info(self, painter):
@@ -1118,10 +1153,11 @@ class PPIDisplayWidget(QWidget):
         # Combine all tracks with valid CPA/TCPA
         all_tracks = []
         for t in self.radar_tracks:
-            if 'cpa' in t and 'tcpa' in t and t['tcpa'] >= 0:
+            if t.get('cpa') is not None and t.get('tcpa') is not None and t['tcpa'] >= 0:
                 all_tracks.append(t)
         for t in self.ais_tracks:
-            if 'cpa' in t and 'tcpa' in t and t['tcpa'] >= 0:
+            # tcpa < 0 = CPA already passed (receding) — not listed
+            if t.get('cpa') is not None and t.get('tcpa') is not None and t['tcpa'] >= 0:
                 all_tracks.append(t)
 
         if not all_tracks:
@@ -1262,10 +1298,11 @@ class PPIDisplayWidget(QWidget):
             info_lines.append(f"NAME: {ais['name'][:20]}")
         if ais.get('mmsi'):
             info_lines.append(f"MMSI: {ais['mmsi']}")
-        if 'course' in ais and 'speed' in ais:
-            info_lines.append(f"COG:{ais['course']:05.1f} SOG:{ais['speed']:04.1f}")
-        if 'cpa' in ais and 'tcpa' in ais:
-            info_lines.append(f"CPA:{ais['cpa']:.2f}NM TCPA:{ais['tcpa']:.1f}m")
+        cog = fmt(ais.get('course'), '05.1f') if ais.get('course_valid', True) else '---'
+        sog = fmt(ais.get('speed'), '04.1f') if ais.get('speed_valid', True) else '---'
+        info_lines.append(f"COG:{cog} SOG:{sog}")
+        info_lines.append(f"CPA:{fmt(ais.get('cpa'), '.2f', 'NM')} "
+                          f"TCPA:{fmt_tcpa(ais.get('tcpa'), 'm')}")
         if ais.get('encrypted'):
             key = ais.get('decrypt_key', '?')
             info_lines.append(f"SA-AIS [{key}]")

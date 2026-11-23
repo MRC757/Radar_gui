@@ -70,11 +70,6 @@ class NMEAConfigDialog(QDialog):
         
         # Bottom buttons
         button_layout = QHBoxLayout()
-        
-        test_btn = QPushButton("Test Connections")
-        test_btn.clicked.connect(self.test_connections)
-        button_layout.addWidget(test_btn)
-        
         button_layout.addStretch()
         
         save_btn = QPushButton("Save")
@@ -102,7 +97,8 @@ class NMEAConfigDialog(QDialog):
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        table.setColumnWidth(5, 80)
         
         return table
         
@@ -524,13 +520,25 @@ class NMEAConfigDialog(QDialog):
         enabled.setChecked(True)
         table.setCellWidget(row, 4, enabled)
         
-        # Delete button
+        # Delete button — uses widget lookup so row index stays correct
+        # even after other rows have been deleted above it.
         delete_btn = QPushButton("Delete")
-        delete_btn.clicked.connect(lambda: self.delete_source(table, row))
+        delete_btn.setMinimumWidth(75)
+        delete_btn.clicked.connect(
+            lambda checked=False, btn=delete_btn, t=table:
+                self._delete_by_widget(t, btn)
+        )
         table.setCellWidget(row, 5, delete_btn)
-        
+
+    def _delete_by_widget(self, table, widget):
+        """Find the row that contains widget in the Actions column and remove it."""
+        for row in range(table.rowCount()):
+            if table.cellWidget(row, 5) == widget:
+                table.removeRow(row)
+                return
+
     def delete_source(self, table, row):
-        """Delete a source from the table"""
+        """Delete a source from the table by row index (used by load_sources)."""
         table.removeRow(row)
         
     def load_sources(self):
@@ -575,6 +583,7 @@ class NMEAConfigDialog(QDialog):
                     
                     # Delete button
                     delete_btn = QPushButton("Delete")
+                    delete_btn.setMinimumWidth(75)
                     delete_btn.clicked.connect(lambda r=row, t=table: self.delete_source(t, r))
                     table.setCellWidget(row, 5, delete_btn)
                     
@@ -655,13 +664,6 @@ class NMEAConfigDialog(QDialog):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save configuration: {e}")
             
-    def test_connections(self):
-        """Test all configured connections"""
-        # This would actually try to connect to each source
-        QMessageBox.information(self, "Connection Test",
-                               "Connection test feature would check each configured source.\n\n"
-                               "This is a placeholder for production implementation.")
-        
     def get_config(self):
         """Get current configuration"""
         return self.config
