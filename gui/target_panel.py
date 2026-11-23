@@ -38,19 +38,19 @@ class SelectedTargetPanel(QGroupBox):
 
     def _setup_ui(self):
         layout = QGridLayout()
-        layout.setSpacing(2)
+        layout.setSpacing(3)
         self.setLayout(layout)
 
-        label_style = "color: #AAAAAA; font-family: Consolas; font-size: 10px;"
-        self._value_style = "color: #00FF00; font-family: Consolas; font-size: 10px;"
+        label_style = "color: #AAAAAA; font-family: Consolas; font-size: 13px;"
+        self._value_style = "color: #00FF00; font-family: Consolas; font-size: 13px;"
 
         for i, (text, key) in enumerate(self._ROWS):
             label = QLabel(f"{text}:")
             label.setStyleSheet(label_style)
-            label.setFont(QFont("Consolas", 10))
+            label.setFont(QFont("Consolas", 13))
             value = QLabel("--")
             value.setStyleSheet(self._value_style)
-            value.setFont(QFont("Consolas", 10))
+            value.setFont(QFont("Consolas", 13))
             layout.addWidget(label, i, 0)
             layout.addWidget(value, i, 1)
             self._fields[key] = value
@@ -80,18 +80,18 @@ class SelectedTargetPanel(QGroupBox):
         }
         self._fields['risk_label'].setStyleSheet(
             f"color: {risk_colors.get(risk, '#00FF00')}; font-family: Consolas; "
-            f"font-size: 10px; font-weight: bold;"
+            f"font-size: 13px; font-weight: bold;"
         )
 
         cls = data.get('classification')
         self._fields['class_label'].setText(cls.upper() if cls else '--')
         if cls == 'hostile':
             self._fields['class_label'].setStyleSheet(
-                "color: #FF0000; font-family: Consolas; font-size: 10px; font-weight: bold;"
+                "color: #FF0000; font-family: Consolas; font-size: 13px; font-weight: bold;"
             )
         elif cls == 'friendly':
             self._fields['class_label'].setStyleSheet(
-                "color: #00CC00; font-family: Consolas; font-size: 10px; font-weight: bold;"
+                "color: #00CC00; font-family: Consolas; font-size: 13px; font-weight: bold;"
             )
         else:
             self._fields['class_label'].setStyleSheet(self._value_style)
@@ -100,7 +100,7 @@ class SelectedTargetPanel(QGroupBox):
         self._fields['guard_label'].setText(', '.join(guards) if guards else 'CLEAR')
         if guards:
             self._fields['guard_label'].setStyleSheet(
-                "color: #FF0000; font-family: Consolas; font-size: 10px; font-weight: bold;"
+                "color: #FF0000; font-family: Consolas; font-size: 13px; font-weight: bold;"
             )
         else:
             self._fields['guard_label'].setStyleSheet(self._value_style)
@@ -115,5 +115,7 @@ class SelectedTargetPanel(QGroupBox):
 
     def apply_theme_colors(self, primary_hex: str, border_hex: str):
         """Re-style with theme colors."""
-        self.setStyleSheet(f"QGroupBox {{ color: {primary_hex}; font-weight: bold; }}")
-        self._value_style = f"color: {primary_hex}; font-family: Consolas; font-size: 10px;"
+        self.setStyleSheet(
+            f"QGroupBox {{ color: {primary_hex}; font-weight: bold; font-size: 13px; }}"
+        )
+        self._value_style = f"color: {primary_hex}; font-family: Consolas; font-size: 13px;"

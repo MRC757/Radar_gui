@@ -1,0 +1,16 @@
+2026-02-24 20:44:01  STARTUP         ---               Alarm manager initialized
+2026-02-24 20:44:02  TRIGGERED       sensor_loss       GPS, Heading, Depth data offline
+2026-02-24 20:44:04  ACKNOWLEDGED    sensor_loss       GPS, Heading, Depth data offline
+2026-02-24 20:44:53  SILENCED_ALL    ---               Operator globally silenced all alarms
+2026-02-24 20:48:42  STARTUP         ---               Alarm manager initialized
+2026-02-24 20:48:43  TRIGGERED       sensor_loss       GPS, Heading, Depth data offline
+2026-02-24 20:48:45  ACKNOWLEDGED    sensor_loss       GPS, Heading, Depth data offline
+2026-02-24 20:49:15  SILENCED_ALL    ---               Operator globally silenced all alarms
+2026-02-24 20:49:52  STARTUP         ---               Alarm manager initialized
+2026-02-24 20:49:53  TRIGGERED       sensor_loss       GPS, Heading, Depth data offline
+2026-02-24 20:49:58  ACKNOWLEDGED    sensor_loss       GPS, Heading, Depth data offline
+2026-02-24 20:50:04  SILENCED_ALL    ---               Operator globally silenced all alarms
+2026-02-24 20:54:15  STARTUP         ---               Alarm manager initialized
+2026-02-24 20:54:16  TRIGGERED       sensor_loss       GPS, Heading, Depth data offline
+2026-02-24 20:54:23  ACKNOWLEDGED    sensor_loss       GPS, Heading, Depth data offline
+2026-02-24 20:54:49  SILENCED_ALL    ---               Operator globally silenced all alarms

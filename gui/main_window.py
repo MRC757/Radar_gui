@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QGroupBox, QComboBox,
                              QSlider, QStatusBar, QDockWidget,
                              QMenuBar, QMenu, QTextEdit, QMessageBox,
-                             QDialog, QGridLayout, QDoubleSpinBox)
+                             QDialog, QGridLayout, QDoubleSpinBox, QSizeGrip)
 from PyQt6.QtCore import Qt, QTimer, QPointF, QEvent, pyqtSignal
 from PyQt6.QtGui import (QAction, QShortcut, QKeySequence,
                          QPainter, QPen, QBrush, QFont, QPainterPath, QPixmap, QColor)
@@ -84,6 +84,50 @@ class _SystemMessagesDialog(QDialog):
         self._text.append(line)
 
 
+class _AISTargetsDialog(QDialog):
+    """Non-modal popup showing the live AIS target list."""
+
+    def __init__(self, content, theme, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("AIS Targets")
+        self.resize(500, 400)
+        self.setMinimumSize(350, 200)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+
+        self._text = QTextEdit()
+        self._text.setReadOnly(True)
+        self._text.setStyleSheet(
+            f"QTextEdit {{ background-color: {theme.ppi_background.name()};"
+            " color: #FFDC00;"
+            " font-family: Consolas; font-size: 11px;"
+            f" border: 1px solid {theme.grid_lines.name()}; }}"
+        )
+        self._text.setPlainText(content)
+        layout.addWidget(self._text)
+
+        close_btn = QPushButton("Close")
+        close_btn.setFixedWidth(90)
+        close_btn.clicked.connect(self.close)
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+
+        self.setStyleSheet(
+            f"QDialog {{ background-color: {theme.ppi_background.name()}; }}"
+            f" QPushButton {{ background-color: #333333; color: {theme.text_overlay.name()};"
+            " border: 1px solid #555555; padding: 4px 12px;"
+            " font-family: Consolas; font-size: 10px; }}"
+            " QPushButton:hover { background-color: #555555; }"
+        )
+
+    def update_content(self, text):
+        """Update the displayed AIS targets text."""
+        self._text.setPlainText(text)
+
+
 class _ClickableLabel(QLabel):
     """QLabel that emits a signal on left double-click."""
     double_clicked = pyqtSignal()
@@ -143,7 +187,7 @@ class _HelpDialog(QDialog):
     """Help dialog showing PPI symbol legend and keyboard shortcuts."""
 
     _SHORTCUTS = [
-        ("S",          "Alarm Acknowledge — silence active alarms"),
+        ("S",          "Alarm Acknowledge — acknowledge next unacknowledged alarm"),
         ("Z",          "PPI Range In  (decrease range scale)"),
         ("X",          "PPI Range Out (increase range scale)"),
         ("+  /  =",    "Range Out (increase range scale)"),
@@ -232,6 +276,8 @@ class RadarMainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("NextGen Radar Display - CG-ARPA")
         self.setGeometry(100, 100, 1600, 1000)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self._drag_pos = None   # for frameless window drag-to-move
 
         # Initialize core components
         self.nmea_parser = MultiSourceNMEAParser()
@@ -258,8 +304,19 @@ class RadarMainWindow(QMainWindow):
         self._all_messages = []
         self._sysmsg_dialog = None
 
+        # AIS Targets popup dialog reference
+        self._ais_targets_dialog = None
+
         # Anchor Watch dialog reference
         self._anchor_watch_dialog = None
+
+        # Alarm silence auto-unsilence timer (5 minutes)
+        self._silence_timer = QTimer(self)
+        self._silence_timer.setSingleShot(True)
+        self._silence_timer.timeout.connect(self._auto_unsilence)
+        self._silence_countdown_timer = QTimer(self)
+        self._silence_countdown_timer.timeout.connect(self._update_silence_countdown)
+        self._silence_end_time = None
 
         # NMEA staleness tracking — last time each supplemental sentence was received
         self._last_stw_time = None
@@ -364,6 +421,18 @@ class RadarMainWindow(QMainWindow):
                                        parent=self)
         dialog.show()
         self._sysmsg_dialog = dialog
+
+    def _open_ais_targets_popup(self):
+        """Open (or raise) the AIS targets popup window."""
+        if self._ais_targets_dialog is not None and self._ais_targets_dialog.isVisible():
+            self._ais_targets_dialog.raise_()
+            self._ais_targets_dialog.activateWindow()
+            return
+
+        dialog = _AISTargetsDialog(self.ais_list.toPlainText(),
+                                   self._current_theme, parent=self)
+        dialog.show()
+        self._ais_targets_dialog = dialog
 
     # ------------------------------------------------------------------
     # Menu bar
@@ -564,6 +633,18 @@ class RadarMainWindow(QMainWindow):
         set_vrm2_action.triggered.connect(lambda: self.show_set_vrm_dialog(2))
         ebl_vrm_menu.addAction(set_vrm2_action)
 
+        # Panels submenu — AIS Targets and System Messages moved here
+        view_menu.addSeparator()
+        panels_menu = view_menu.addMenu("&Panels")
+
+        ais_targets_panel_action = QAction("&AIS Targets...", self)
+        ais_targets_panel_action.triggered.connect(self._open_ais_targets_popup)
+        panels_menu.addAction(ais_targets_panel_action)
+
+        sysmsg_panel_action = QAction("&System Messages...", self)
+        sysmsg_panel_action.triggered.connect(self._open_sysmsg_popup)
+        panels_menu.addAction(sysmsg_panel_action)
+
         # Alarm controls
         view_menu.addSeparator()
         self.silence_action = QAction("S&ilence Alarms", self)
@@ -582,6 +663,78 @@ class RadarMainWindow(QMainWindow):
         shortcuts_action = QAction("PPI Symbols && Keyboard Shortcuts...", self)
         shortcuts_action.triggered.connect(self.show_help_dialog)
         help_menu.addAction(shortcuts_action)
+
+        # Frameless window controls — sit in the right corner of the menu bar
+        _btn_style = (
+            "QPushButton { background: #1a1a1a; color: #cccccc; border: none; "
+            "font-size: 13px; padding: 0 8px; min-width: 32px; min-height: 22px; }"
+            "QPushButton:hover { background: #333333; }"
+            "#wm_close:hover { background: #cc2222; color: #ffffff; }"
+        )
+        ctrl_widget = QWidget()
+        ctrl_widget.setStyleSheet(_btn_style)
+        ctrl_layout = QHBoxLayout(ctrl_widget)
+        ctrl_layout.setContentsMargins(0, 0, 0, 0)
+        ctrl_layout.setSpacing(0)
+
+        min_btn = QPushButton("─")
+        min_btn.setToolTip("Minimize")
+        min_btn.clicked.connect(self.showMinimized)
+
+        max_btn = QPushButton("⬜")
+        max_btn.setToolTip("Maximize / Restore")
+        max_btn.clicked.connect(self._toggle_maximize)
+
+        close_btn = QPushButton("✕")
+        close_btn.setObjectName("wm_close")
+        close_btn.setToolTip("Close")
+        close_btn.clicked.connect(self.close)
+
+        ctrl_layout.addWidget(min_btn)
+        ctrl_layout.addWidget(max_btn)
+        ctrl_layout.addWidget(close_btn)
+        menubar.setCornerWidget(ctrl_widget, Qt.Corner.TopRightCorner)
+
+        # Enable drag-to-move from the empty area of the menu bar
+        menubar.installEventFilter(self)
+
+    # ------------------------------------------------------------------
+    # Frameless window management
+    # ------------------------------------------------------------------
+
+    def _toggle_maximize(self):
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
+    def eventFilter(self, obj, event):
+        """Handle drag-to-move and double-click-to-maximize from the menu bar."""
+        if obj is self.menuBar():
+            etype = event.type()
+            if etype == QEvent.Type.MouseButtonPress:
+                if (event.button() == Qt.MouseButton.LeftButton
+                        and self.menuBar().actionAt(event.pos()) is None):
+                    self._drag_pos = event.globalPosition().toPoint()
+                    return True
+            elif etype == QEvent.Type.MouseButtonDblClick:
+                if self.menuBar().actionAt(event.pos()) is None:
+                    self._toggle_maximize()
+                    return True
+            elif etype == QEvent.Type.MouseMove:
+                if (event.buttons() & Qt.MouseButton.LeftButton
+                        and self._drag_pos is not None):
+                    if self.isMaximized():
+                        self.showNormal()
+                        self._drag_pos = event.globalPosition().toPoint()
+                    else:
+                        delta = event.globalPosition().toPoint() - self._drag_pos
+                        self.move(self.pos() + delta)
+                        self._drag_pos = event.globalPosition().toPoint()
+                    return True
+            elif etype == QEvent.Type.MouseButtonRelease:
+                self._drag_pos = None
+        return super().eventFilter(obj, event)
 
     def open_nmea_config(self):
         """Open NMEA configuration dialog"""
@@ -651,6 +804,7 @@ class RadarMainWindow(QMainWindow):
         dialog = BITWindow(
             radar_interface=self.radar_interface,
             nmea_parser=self.nmea_parser,
+            alarm_manager=self.alarm_manager,
             parent=self,
         )
         dialog.setStyleSheet(dialog_stylesheet(self._current_theme))
@@ -771,13 +925,20 @@ class RadarMainWindow(QMainWindow):
         self.orientation_combo.setCurrentIndex(idx)
 
     def _ack_alarm(self):
-        """Acknowledge (silence) active alarms — S key."""
-        if self.alarm_manager.active_alarms:
-            self.alarm_manager.silence()
-            self.log_message("ALARM ACKNOWLEDGED")
-            self.silence_action.blockSignals(True)
-            self.silence_action.setChecked(True)
-            self.silence_action.blockSignals(False)
+        """Acknowledge the first unacknowledged active alarm — S key.
+
+        Each press acknowledges exactly one alarm in display order so the
+        operator must consciously confirm every individual alarm condition.
+        New alarms that arrive after all existing ones are acknowledged will
+        still sound and flash until explicitly acknowledged.
+        """
+        entries = self.alarm_manager.get_recent_entries(20)
+        for entry in entries:
+            if entry.active and not entry.silenced:
+                self.alarm_manager.silence_type(entry.alarm_type)
+                label = entry.alarm_type.upper().replace('_', ' ')
+                self.log_message(f"ALARM ACKNOWLEDGED: {label}")
+                return
 
     # ------------------------------------------------------------------
     # EBL / VRM controls
@@ -929,10 +1090,41 @@ class RadarMainWindow(QMainWindow):
     def toggle_alarm_silence(self, checked):
         if checked:
             self.alarm_manager.silence()
-            self.log_message("ALARMS SILENCED")
+            self._silence_end_time = datetime.now() + timedelta(minutes=5)
+            self._silence_timer.start(5 * 60 * 1000)
+            self._silence_countdown_timer.start(1000)
+            self._update_silence_countdown()
+            self.log_message("ALARMS SILENCED — auto-unsilence in 5 minutes")
         else:
             self.alarm_manager.unsilence()
+            self._silence_timer.stop()
+            self._silence_countdown_timer.stop()
+            self._silence_end_time = None
+            self.alarm_label.setText("")
             self.log_message("ALARMS ACTIVE")
+
+    def _auto_unsilence(self):
+        """Called when the 5-minute global silence timer expires."""
+        self._silence_countdown_timer.stop()
+        self._silence_end_time = None
+        self.alarm_manager.unsilence()
+        self.silence_action.blockSignals(True)
+        self.silence_action.setChecked(False)
+        self.silence_action.blockSignals(False)
+        self.alarm_label.setText("")
+        self.log_message("ALARMS AUTO-UNSILENCED — 5 minute timeout expired")
+
+    def _update_silence_countdown(self):
+        """Update the status bar countdown label while alarms are globally silenced."""
+        if self._silence_end_time is None:
+            return
+        remaining = (self._silence_end_time - datetime.now()).total_seconds()
+        if remaining <= 0:
+            self.alarm_label.setText("")
+            return
+        mins = int(remaining) // 60
+        secs = int(remaining) % 60
+        self.alarm_label.setText(f"SILENCED  {mins}:{secs:02d}")
 
     def _update_ebl_vrm_status(self):
         """Update status bar EBL/VRM readout."""
@@ -974,6 +1166,8 @@ class RadarMainWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Radar System Ready")
+        # Resize grip for frameless window
+        self.status_bar.setSizeGripEnabled(True)
 
         # Cursor position label in status bar (permanent)
         self.cursor_label = QLabel("BRG: ---   RNG: ---")
@@ -1168,45 +1362,45 @@ class RadarMainWindow(QMainWindow):
 
         # Own ship info
         own_ship_group = QGroupBox("OWN SHIP")
-        own_ship_group.setStyleSheet("QGroupBox { color: #00FF00; font-weight: bold; }")
+        own_ship_group.setStyleSheet("QGroupBox { color: #00FF00; font-weight: bold; font-size: 14px; }")
         own_ship_layout = QVBoxLayout()
 
         # Time / Date  (double-click opens timezone dialog)
         _time_tip = "Double-click to set time zone"
         self.date_label = _ClickableLabel("DATE: ----/--/--")
-        self.date_label.setStyleSheet("color: #00FF00; font-family: Consolas; font-size: 11px;")
+        self.date_label.setStyleSheet("color: #00FF00; font-family: Consolas; font-size: 15px;")
         self.date_label.setToolTip(_time_tip)
         self.date_label.double_clicked.connect(self._open_timezone_dialog)
 
         self.time_label = _ClickableLabel("TIME: --:--:-- UTC")
-        self.time_label.setStyleSheet("color: #00FF00; font-family: Consolas; font-size: 11px;")
+        self.time_label.setStyleSheet("color: #00FF00; font-family: Consolas; font-size: 15px;")
         self.time_label.setToolTip(_time_tip)
         self.time_label.double_clicked.connect(self._open_timezone_dialog)
 
         self.position_label = QLabel("POSN: -- / --")
-        self.position_label.setStyleSheet("color: #00FF00; font-family: Consolas; font-size: 11px;")
+        self.position_label.setStyleSheet("color: #00FF00; font-family: Consolas; font-size: 15px;")
 
         self.heading_label = QLabel("HDG:  ---\u00b0")
-        self.heading_label.setStyleSheet("color: #00FF00; font-family: Consolas; font-size: 11px;")
+        self.heading_label.setStyleSheet("color: #00FF00; font-family: Consolas; font-size: 15px;")
 
         self.sog_label = QLabel("SOG:  --.- kts")
-        self.sog_label.setStyleSheet("color: #00FF00; font-family: Consolas; font-size: 11px;")
+        self.sog_label.setStyleSheet("color: #00FF00; font-family: Consolas; font-size: 15px;")
 
         self.stw_label = QLabel("STW:  --.- kts")
-        self.stw_label.setStyleSheet("color: #00FF00; font-family: Consolas; font-size: 11px;")
+        self.stw_label.setStyleSheet("color: #00FF00; font-family: Consolas; font-size: 15px;")
 
         self.depth_label = QLabel("DEPTH: --.- m")
-        self.depth_label.setStyleSheet("color: #00FF00; font-family: Consolas; font-size: 11px;")
+        self.depth_label.setStyleSheet("color: #00FF00; font-family: Consolas; font-size: 15px;")
 
         self.water_temp_label = QLabel("WTMP: --.- \u00b0C")
-        self.water_temp_label.setStyleSheet("color: #00FF00; font-family: Consolas; font-size: 11px;")
+        self.water_temp_label.setStyleSheet("color: #00FF00; font-family: Consolas; font-size: 15px;")
 
         self.wind_label = QLabel("WIND: ---\u00b0 / --.- kts")
-        self.wind_label.setStyleSheet("color: #00FF00; font-family: Consolas; font-size: 11px;")
+        self.wind_label.setStyleSheet("color: #00FF00; font-family: Consolas; font-size: 15px;")
 
         self.spoofing_label = QLabel("")
         self.spoofing_label.setStyleSheet(
-            "color: #FF0000; font-family: Consolas; font-size: 11px; font-weight: bold;"
+            "color: #FF0000; font-family: Consolas; font-size: 15px; font-weight: bold;"
         )
         self.spoofing_label.setVisible(False)
 
@@ -1225,17 +1419,17 @@ class RadarMainWindow(QMainWindow):
 
         # NMEA Source Status
         source_group = QGroupBox("NMEA SOURCES")
-        source_group.setStyleSheet("QGroupBox { color: #00CCFF; font-weight: bold; }")
+        source_group.setStyleSheet("QGroupBox { color: #00CCFF; font-weight: bold; font-size: 14px; }")
         source_layout = QVBoxLayout()
 
         self.gps_source_label = QLabel("GPS: --")
-        self.gps_source_label.setStyleSheet("color: #00CCFF; font-family: Consolas; font-size: 10px;")
+        self.gps_source_label.setStyleSheet("color: #00CCFF; font-family: Consolas; font-size: 14px;")
 
         self.heading_source_label = QLabel("HDG: --")
-        self.heading_source_label.setStyleSheet("color: #00CCFF; font-family: Consolas; font-size: 10px;")
+        self.heading_source_label.setStyleSheet("color: #00CCFF; font-family: Consolas; font-size: 14px;")
 
         self.depth_source_label = QLabel("DEPTH: --")
-        self.depth_source_label.setStyleSheet("color: #00CCFF; font-family: Consolas; font-size: 10px;")
+        self.depth_source_label.setStyleSheet("color: #00CCFF; font-family: Consolas; font-size: 14px;")
 
         source_layout.addWidget(self.gps_source_label)
         source_layout.addWidget(self.heading_source_label)
@@ -1245,17 +1439,17 @@ class RadarMainWindow(QMainWindow):
 
         # Radar status
         radar_group = QGroupBox("RADAR STATUS")
-        radar_group.setStyleSheet("QGroupBox { color: #00FF00; font-weight: bold; }")
+        radar_group.setStyleSheet("QGroupBox { color: #00FF00; font-weight: bold; font-size: 14px; }")
         radar_layout = QVBoxLayout()
 
         self.radar_status_label = QLabel("Status: STANDBY")
-        self.radar_status_label.setStyleSheet("color: #FFFF00; font-family: Consolas; font-size: 11px;")
+        self.radar_status_label.setStyleSheet("color: #FFFF00; font-family: Consolas; font-size: 15px;")
 
         self.target_count_label = QLabel("TGT: 000")
-        self.target_count_label.setStyleSheet("color: #00FF00; font-family: Consolas; font-size: 11px;")
+        self.target_count_label.setStyleSheet("color: #00FF00; font-family: Consolas; font-size: 15px;")
 
         self.ais_count_label = QLabel("AIS: 000")
-        self.ais_count_label.setStyleSheet("color: #FFDC00; font-family: Consolas; font-size: 11px;")
+        self.ais_count_label.setStyleSheet("color: #FFDC00; font-family: Consolas; font-size: 15px;")
 
         radar_layout.addWidget(self.radar_status_label)
         radar_layout.addWidget(self.target_count_label)
@@ -1267,52 +1461,16 @@ class RadarMainWindow(QMainWindow):
         self.target_panel = SelectedTargetPanel()
         layout.addWidget(self.target_panel)
 
-        # AIS Targets List
-        ais_list_group = QGroupBox("AIS TARGETS")
-        ais_list_group.setStyleSheet("QGroupBox { color: #FFDC00; font-weight: bold; }")
-        ais_list_layout = QVBoxLayout()
-
+        # AIS Targets — hidden data buffer; displayed via View > Panels > AIS Targets
         self.ais_list = QTextEdit()
         self.ais_list.setReadOnly(True)
-        self.ais_list.setMaximumHeight(200)
-        self.ais_list.setStyleSheet("""
-            QTextEdit {
-                background-color: #000000;
-                color: #FFDC00;
-                font-family: Consolas;
-                font-size: 9px;
-                border: 1px solid #00FF00;
-            }
-        """)
-        ais_list_layout.addWidget(self.ais_list)
-        ais_list_group.setLayout(ais_list_layout)
-        layout.addWidget(ais_list_group)
+        self.ais_list.hide()
 
-        # System Messages
-        msg_group = QGroupBox("SYSTEM MESSAGES")
-        msg_group.setStyleSheet("QGroupBox { color: #00CCFF; font-weight: bold; }")
-        msg_layout = QVBoxLayout()
-
+        # System Messages — hidden data buffer; displayed via View > Panels > System Messages
         self.message_display = QTextEdit()
         self.message_display.setReadOnly(True)
-        self.message_display.setMaximumHeight(150)
-        self.message_display.setStyleSheet("""
-            QTextEdit {
-                background-color: #000000;
-                color: #00CCFF;
-                font-family: Consolas;
-                font-size: 9px;
-                border: 1px solid #00FF00;
-            }
-        """)
-        msg_layout.addWidget(self.message_display)
-        msg_group.setLayout(msg_layout)
-        layout.addWidget(msg_group)
-
-        # Double-click on the group box or text area opens full log popup
-        msg_group.installEventFilter(self)
-        self.message_display.installEventFilter(self)
-        self._sysmsg_group = msg_group
+        self.message_display.hide()
+        self._sysmsg_group = None
 
         layout.addStretch()
 
@@ -1341,7 +1499,7 @@ class RadarMainWindow(QMainWindow):
             clear_btn.setFixedWidth(40)
             clear_btn.setStyleSheet(
                 "QPushButton { background-color: #222; color: #FF4444; "
-                "border: 1px solid #AA0000; font-family: Consolas; font-size: 9px; }"
+                "border: 1px solid #AA0000; font-family: Consolas; font-size: 11px; }"
                 "QPushButton:hover { background-color: #440000; }"
             )
             clear_btn.clicked.connect(lambda _, idx=i: self._clear_target_slot(idx))
@@ -1467,7 +1625,7 @@ class RadarMainWindow(QMainWindow):
                 inner.setStyleSheet(dock_widget_style)
 
         # Own ship labels
-        own_ship_style = f"color: {primary}; font-family: Consolas; font-size: 11px;"
+        own_ship_style = f"color: {primary}; font-family: Consolas; font-size: 15px;"
         for label in (self.date_label, self.time_label,
                       self.position_label, self.heading_label,
                       self.sog_label, self.stw_label, self.depth_label,
@@ -1475,17 +1633,17 @@ class RadarMainWindow(QMainWindow):
             label.setStyleSheet(own_ship_style)
 
         # Source labels
-        source_style = f"color: {secondary}; font-family: Consolas; font-size: 10px;"
+        source_style = f"color: {secondary}; font-family: Consolas; font-size: 14px;"
         for label in (self.gps_source_label, self.heading_source_label,
                       self.depth_source_label):
             label.setStyleSheet(source_style)
 
         # Radar status
         self.target_count_label.setStyleSheet(
-            f"color: {primary}; font-family: Consolas; font-size: 11px;"
+            f"color: {primary}; font-family: Consolas; font-size: 15px;"
         )
         self.ais_count_label.setStyleSheet(
-            f"color: {warning}; font-family: Consolas; font-size: 11px;"
+            f"color: {warning}; font-family: Consolas; font-size: 15px;"
         )
 
         # Text areas
@@ -2406,6 +2564,9 @@ class RadarMainWindow(QMainWindow):
             ais_text += f"{i+1:02d}  {name:15s} {mmsi}\n"
             ais_text += f"    COG:{cog:05.1f}\u00b0 SOG:{sog:04.1f}kts\n"
         self.ais_list.setPlainText(ais_text)
+        if (self._ais_targets_dialog is not None
+                and self._ais_targets_dialog.isVisible()):
+            self._ais_targets_dialog.update_content(ais_text)
 
     def on_source_status_updated(self, status):
         self.gps_source_label.setText(f"GPS: {status.get('active_gps', 'None')}")

@@ -2,9 +2,19 @@
 Built-In Test (BIT) Window
 Displays radar system fault status: transmitter, motor, temperature, etc.
 Typical of marine radar BIT panels per IEC 62388.
+
+Software self-tests (functional without radar SDK):
+  - CONFIG FILES  — verifies nmea_config.json and ais_encrypt_config.json are
+                    present and contain valid JSON
+  - ALARM LOG     — verifies the alarm log file is writable
+  - GPS INPUT     — live NMEA parser source status
+  - HEADING INPUT — live NMEA parser source status
+  - GPS SPOOFING  — live spoofing detector state
 """
 
+import json
 from datetime import datetime
+from pathlib import Path
 
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QGroupBox,
                              QLabel, QPushButton, QGridLayout, QTextEdit)
@@ -64,15 +74,25 @@ class BITWindow(QDialog):
         ("gps_spoofing",   "GPS SPOOFING"),
         ("ais_input",      "AIS INPUT"),
         ("display",        "DISPLAY UNIT"),
+        ("config_files",   "CONFIG FILES"),
+        ("alarm_log",      "ALARM LOG"),
     ]
 
-    def __init__(self, radar_interface=None, nmea_parser=None, parent=None):
+    # Config files required for normal operation
+    _CONFIG_FILES = [
+        Path("config/nmea_config.json"),
+        Path("config/ais_encrypt_config.json"),
+    ]
+
+    def __init__(self, radar_interface=None, nmea_parser=None,
+                 alarm_manager=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Built-In Test (BIT)")
-        self.setMinimumSize(520, 560)
+        self.setMinimumSize(520, 600)
 
         self._radar = radar_interface
         self._nmea = nmea_parser
+        self._alarm_manager = alarm_manager
 
         # Fault state dict
         self._faults = {key: False for key, _ in self._FAULT_DEFS}
@@ -142,6 +162,10 @@ class BITWindow(QDialog):
         clear_btn = QPushButton("Clear Faults")
         clear_btn.clicked.connect(self._clear_faults)
         btn_layout.addWidget(clear_btn)
+
+        audio_btn = QPushButton("Test Alarm Audio")
+        audio_btn.clicked.connect(self._test_alarm_audio)
+        btn_layout.addWidget(audio_btn)
 
         btn_layout.addStretch()
 
@@ -233,6 +257,10 @@ class BITWindow(QDialog):
                 self.set_fault("gps_spoofing",
                                self._nmea.spoofing_detector.is_alert)
 
+        # Software self-tests (no radar SDK required)
+        self.set_fault("config_files", not self._check_config_files())
+        self.set_fault("alarm_log",    not self._check_alarm_log())
+
     # ------------------------------------------------------------------
     # Actions
     # ------------------------------------------------------------------
@@ -240,14 +268,75 @@ class BITWindow(QDialog):
     def _run_full_test(self):
         """Run a full built-in test sequence."""
         self._log("--- FULL BIT INITIATED ---")
+
+        # Software self-tests with detail
+        cfg_ok = self._check_config_files()
+        if cfg_ok:
+            self._log("  PASS: Config files present and valid JSON")
+        else:
+            self._log("  FAIL: One or more config files missing or invalid")
+
+        log_ok = self._check_alarm_log()
+        if log_ok:
+            self._log("  PASS: Alarm log is writable")
+        else:
+            self._log("  FAIL: Alarm log directory/file not writable")
+
+        if self._nmea is not None and hasattr(self._nmea, 'get_source_status'):
+            nmea_status = self._nmea.get_source_status()
+            gps_src = nmea_status.get("active_gps", "")
+            hdg_src = nmea_status.get("active_heading", "")
+            if gps_src and gps_src not in ("None", ""):
+                self._log(f"  PASS: GPS source active ({gps_src})")
+            else:
+                self._log("  FAIL: No active GPS source")
+            if hdg_src and hdg_src not in ("None", ""):
+                self._log(f"  PASS: Heading source active ({hdg_src})")
+            else:
+                self._log("  FAIL: No active heading source")
+
+        # Update all indicators
         self._poll_status()
+
         active = [dict(self._FAULT_DEFS)[k] for k, v in self._faults.items() if v]
         if active:
             for name in active:
-                self._log(f"  FAIL: {name}")
+                self._log(f"  FAULT: {name}")
             self._log(f"BIT RESULT: {len(active)} FAULT(S)")
         else:
             self._log("BIT RESULT: ALL TESTS PASSED")
+
+    def _check_config_files(self) -> bool:
+        """Return True if all required config files exist and contain valid JSON."""
+        for path in self._CONFIG_FILES:
+            if not path.exists():
+                return False
+            try:
+                with open(path, encoding='utf-8') as f:
+                    json.load(f)
+            except Exception:
+                return False
+        return True
+
+    def _check_alarm_log(self) -> bool:
+        """Return True if the alarm log file/directory is writable."""
+        log_path = Path("logs") / "alarm_log.txt"
+        try:
+            log_path.parent.mkdir(exist_ok=True)
+            with open(log_path, 'a', encoding='utf-8'):
+                pass
+            return True
+        except Exception:
+            return False
+
+    def _test_alarm_audio(self):
+        """Play a test tone to verify audio output (bypasses silence/cooldown)."""
+        self._log("Testing alarm audio...")
+        if self._alarm_manager is not None:
+            self._alarm_manager.play_test_tone('sensor_loss')
+            self._log("  Test tone played. If no sound, check system audio output.")
+        else:
+            self._log("  No alarm manager available — audio test skipped.")
 
     def _clear_faults(self):
         """Clear all latched fault indicators."""

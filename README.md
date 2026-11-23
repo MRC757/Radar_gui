@@ -167,10 +167,12 @@ Fixed-position display in the top-left of the PPI showing:
 - **GPS Spoofing** — Alternating warble when spoofing is detected
 - **Sensor Loss** — Low-frequency slow beep when GPS, heading, or depth source goes offline
 - **Anchor Drag** — Slow double-beep when own ship drifts outside the configured swing radius
-- Per-alarm acknowledge (silence) buttons with flash animation
+- Per-alarm acknowledge buttons with flash animation — **each press of S (or clicking ACK) acknowledges exactly one alarm**; subsequent alarms require separate acknowledgment to ensure operators are alerted to every condition
+- New alarms that arrive after all existing ones are acknowledged will sound and flash until explicitly acknowledged — the S key never pre-silences future alarms
 - Alarm history panel with timestamps
 - Audio via in-memory WAV synthesis through the default sound card
-- Silence / un-silence via View menu or **F12**
+- Global silence / un-silence via View menu or **F12** — automatically re-enables after **5 minutes** with a countdown shown in the status bar; ensures a silenced console cannot miss a new threat indefinitely
+- All alarm events (triggered, acknowledged, silenced, cleared) are appended to **`logs/alarm_log.txt`** with timestamps for post-incident review and compliance records
 
 ### Right-Click Context Menu
 - Target Info dialog with full detail
@@ -188,9 +190,8 @@ Fixed-position display in the top-left of the PPI showing:
 - Full keyboard shortcut reference table
 
 ### System Messages
-- Timestamped log in the right panel
-- Double-click to open a full-size popup window with all messages
-- Non-modal popup allows continued radar operation
+- Accessible via **View > Panels > System Messages...** — opens a non-modal popup with the full timestamped log
+- Non-modal popup allows continued radar operation while reviewing messages
 
 ---
 
@@ -308,6 +309,17 @@ Default UDP ports:
 
 ## Controls
 
+### Window Management (Frameless Mode)
+The main window runs without an OS title bar for a clean full-screen radar presentation:
+
+| Action | How |
+|--------|-----|
+| **Move window** | Click and drag on any empty area of the menu bar (between menu labels and the ─ ⬜ ✕ buttons) |
+| **Maximize / Restore** | Double-click the empty menu bar area, or click **⬜** |
+| **Minimize** | Click **─** in the top-right corner of the menu bar |
+| **Close** | Click **✕** (turns red on hover) or use **Ctrl+Q** |
+| **Resize** | Drag the grip in the bottom-right corner of the status bar; or use Windows snap (Win+Arrow) |
+
 ### Top Control Bar
 
 | Control | Options / Range | Description |
@@ -334,7 +346,7 @@ Default UDP ports:
 | **−** | Decrease display range |
 | **Z** | Range in (zoom in one step) |
 | **X** | Range out (zoom out one step) |
-| **S** | Acknowledge / silence active alarm |
+| **S** | Acknowledge next unacknowledged alarm (one at a time, in display order) |
 | **D** | Cycle display mode (Day › Dusk › Night › Red Night) |
 | **O** | Cycle orientation (N-Up › H-Up › C-Up › True Motion) |
 | **A** | Toggle AIS targets |
@@ -347,7 +359,7 @@ Default UDP ports:
 | **F2** | Toggle EBL2 |
 | **F3** | Toggle VRM1 |
 | **F4** | Toggle VRM2 |
-| **F12** | Silence / un-silence all alarms |
+| **F12** | Silence / un-silence all alarms (auto-re-enables after 5 minutes) |
 | **Ctrl+Q** | Exit application |
 
 ### Settings Menu
@@ -358,7 +370,13 @@ Default UDP ports:
 - **CPA/TCPA Thresholds** — Threat detection gate and risk-tier boundaries
 
 ### Tools Menu
-- **Built-In Test (BIT)** — Radar subsystem fault status panel (transmitter, motor, temperature, receiver, power supply)
+- **Built-In Test (BIT)** — Radar subsystem fault status panel with 1 Hz auto-polling and a fault log. Hardware indicators (transmitter, motor, temperature, receiver, power supply) require a real radar SDK. The following **software self-tests run immediately without any hardware**:
+  - **CONFIG FILES** — verifies `config/nmea_config.json` and `config/ais_encrypt_config.json` are present and contain valid JSON
+  - **ALARM LOG** — verifies the `logs/` directory and alarm log file are writable
+  - **GPS INPUT / HEADING INPUT** — live NMEA parser source status (green = source active)
+  - **GPS SPOOFING** — live spoofing detector state
+  - **Run Full Test** — executes all checks and prints per-item PASS/FAIL detail to the fault log
+  - **Test Alarm Audio** — plays a tone through the default audio device immediately, bypassing any silenced or acknowledged alarm state; use to verify audio output before a voyage
 - **NMEA Monitor** — Live raw NMEA-0183 sentence viewer with source selector, Play/Stop, scroll, and Clear
 
 ### View Menu
@@ -371,19 +389,22 @@ Default UDP ports:
 - Range Rings (show/hide, count, reset)
 - Trail Length (1 / 3 / 6 / 15 / 30 min)
 - EBL/VRM (EBL1, EBL2, VRM1, VRM2)
-- Silence Alarms
+- **Panels** submenu — floating popup windows for secondary data:
+  - **AIS Targets...** — Live list of first 10 AIS vessels (name, MMSI, COG, SOG); updates automatically while open
+  - **System Messages...** — Full timestamped system event log
+- Silence Alarms (F12 global toggle)
 
 ### Help Menu
 - **PPI Symbols & Keyboard Shortcuts...** — Symbol legend and keyboard reference
 
-### Right Panel
+### Right Panel (Navigation & System Data)
 - **OWN SHIP** — Date/time (double-click to set timezone), Position, HDG, SOG, STW, DEPTH, WTMP, WIND; stale labels shown in red
 - **NMEA SOURCES** — Active GPS, heading, depth sources
 - **RADAR STATUS** — Operating status, target and AIS counts
 - **SELECTED TARGET** — Full detail for the clicked target
-- **AIS TARGETS** — List of first 10 AIS vessels
-- **SYSTEM MESSAGES** — Timestamped system log (double-click for full popup)
-- **ALARMS** — Active and recent alarms with per-alarm silence buttons
+- **ALARMS** — Active and recent alarms with per-alarm ACK buttons
+
+> AIS Targets and System Messages are available as floating popups via **View > Panels** to keep the main display uncluttered.
 
 ---
 
@@ -402,6 +423,32 @@ Default UDP ports:
 - **Anchor Drag** audible alarm fires (slow double-beep, 1000 Hz) when drift exceeds the swing radius
 
 Click **Deactivate** or close the dialog to stop monitoring.
+
+---
+
+## Known Limitations
+
+The following features are present in the codebase but are stubs, placeholders, or limited by the mock radar interface:
+
+### Mock Radar Interface (Primary Limitation)
+All radar data — sweep video, ARPA targets, and radar control responses — is **simulated** by `MockRadarInterface`. The three simulated vessels are hardcoded; range, gain, and clutter controls are accepted and logged but have no effect on the data. Replace with a real SDK implementation when hardware is available (see [Radar SDK Integration](#radar-sdk-integration)).
+
+### Built-In Test (BIT) Window
+Hardware indicators (transmitter, motor, temperature, receiver, power supply, signal processor, display) will always report OK when running with the mock radar — the mock interface does not supply fault status. Five software self-tests (config file integrity, alarm log writability, GPS source, heading source, GPS spoofing) are fully functional without any hardware and update at 1 Hz. Full hardware fault detection requires a real SDK that implements `get_status()`.
+
+### Plugin System (`core/plugin_system.py`)
+Three example plugin classes are included as development scaffolding but contain no real implementation:
+- **RecordingPlugin** — File handles open and close correctly, but no radar data is ever written to disk (`pass` in the write loop)
+- **TargetClassificationPlugin** — ML classification hook; returns data unchanged
+- **WeatherOverlayPlugin** — Weather data merge hook; no data source connected
+
+Plugins are not exposed through the application UI.
+
+### Test Scenarios (`core/test_scenarios.py`)
+An automated CPA/TCPA validation test runner is included but has no UI entry point and is not reachable from the running application. It can be executed directly from a Python prompt for development validation.
+
+### Satellite Quality Sentences
+GSA (GPS DOP / fix mode) and GSV (satellites in view) sentences are received and verified but their content is discarded. Satellite count and dilution-of-precision data are not currently displayed or used for position confidence assessment.
 
 ---
 
@@ -538,6 +585,10 @@ A red label means no data has been received from that sensor for more than 10 se
 ---
 
 ## Version History
+
+**v4.2** — Frameless window and BIT / alarm hardening: OS title bar removed; window controls (─ ⬜ ✕) integrated into the right side of the menu bar; drag-to-move from the empty menu bar area; double-click to maximize/restore; resize grip in status bar corner. BIT window made partially functional without radar hardware — CONFIG FILES and ALARM LOG self-tests poll at 1 Hz, Run Full Test prints per-check PASS/FAIL detail, Test Alarm Audio button plays a tone immediately bypassing any silenced alarm state. F12 global silence now auto-re-enables after **5 minutes** with a status bar countdown. All alarm events (triggered, acknowledged, silenced, cleared) appended to `logs/alarm_log.txt` for post-incident review.
+
+**v4.1** — UI readability and alarm safety improvements: AIS Targets and System Messages moved to floating popups under **View > Panels** submenu to keep the main display clean; **S key alarm acknowledgment** changed to sequential one-alarm-at-a-time behavior (operators must consciously confirm each alarm — new alarms always sound and flash regardless of prior acknowledgments); Navigation & System Data panel and Target Data panel text scaled up for improved at-a-glance readability; NMEA Sources dialog Delete button fixed (column width and minimum button size); non-functional "Test Connections" button removed from NMEA Sources dialog; Known Limitations section added to README documenting stub/placeholder features (mock radar, BIT window, plugin system, test scenarios).
 
 **v4.0** — ADS-B / FLARM integration ($PFLAA/$PFLAU UDP receiver, cyan directional triangles, alarm-level color coding, stale-target pruning); PTZ camera control (NMEA-style slew commands via UDP, configurable message template, True/Relative bearing mode, 12 NM PPI bearing line, "Slew Camera to Target" right-click action); Radar Standby/Transmit toggle (STBY/TX button, amber/green color coding, `set_transmit()` SDK hook, `transmit_state_changed` hardware-confirmation signal); AIS target color coding update (unencrypted AIS = green, encrypted SA-AIS = blue); NMEA data staleness indicators (sensor labels turn red after 10 s without data); time/date display in Own Ship panel with double-click timezone configuration (21 presets); keyboard shortcuts updated (S = alarm ACK, Z = range in, X = range out, B = toggle ADS-B); Help > PPI Symbols & Keyboard Shortcuts reference dialog.
 
