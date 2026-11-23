@@ -3,6 +3,8 @@ Main window for Radar GUI application
 Professional ARPA-style interface with IMO-compliant display modes
 """
 
+import math
+import time
 from datetime import datetime, timedelta
 
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -28,7 +30,9 @@ from gui.nmea_monitor_dialog import NMEAMonitorDialog
 from gui.anchor_watch_dialog import AnchorWatchDialog
 from core.multi_source_nmea_parser import MultiSourceNMEAParser
 from core.track_manager import TrackManager
-from core.radar_interface import MockRadarInterface
+from core.radar import create_radar, METERS_PER_NM
+from core.alarm_rules import SensorState, evaluate_alarms
+from gui.formatting import fmt, fmt_course, fmt_speed, fmt_tcpa
 from core.cpa_calculator import calculate_intercept
 from core.alarm_manager import AlarmManager
 from core.camera_controller import CameraController, bearing_between
@@ -282,11 +286,25 @@ class RadarMainWindow(QMainWindow):
         # Initialize core components
         self.nmea_parser = MultiSourceNMEAParser()
         self.track_manager = TrackManager()
-        self.radar_interface = MockRadarInterface()
+        # Radar driver - created from the selected radar_config.json entry
+        # by _switch_radar() once the UI exists (see core/radar/factory.py)
+        self.radar_interface = None
+        self._ui_ready = False
 
         # Own ship state for course propagation
         self._own_speed = 0.0
         self._own_heading = 0.0
+        self._own_cog = None          # course over ground from RMC/VTG
+        self._own_cog_time = None     # monotonic time COG was last received
+        self._depth_seen = False      # depth alarm only after depth has worked once
+
+        # Radar state for link / video-loss alarms
+        self._radar_connected = False
+        self._radar_transmitting = False
+        self._tx_started = None       # monotonic time TX was confirmed
+        self._last_spoke_time = None  # monotonic time of last radar video
+        self._radar_started = None    # monotonic time current driver was started
+        self._radar_was_connected = False
 
         # Currently selected target data (auto-refreshed)
         self._selected_target_data = None
@@ -358,7 +376,8 @@ class RadarMainWindow(QMainWindow):
         self.setup_shortcuts()
 
         # Start radar and NMEA
-        self.radar_interface.start()
+        self._ui_ready = True
+        self._switch_radar(self._active_radar_config)
         self.nmea_parser.start_listening()
 
         # Start camera controller
@@ -1526,6 +1545,7 @@ class RadarMainWindow(QMainWindow):
         # NMEA parser signals
         self.nmea_parser.position_updated.connect(self.on_position_updated)
         self.nmea_parser.heading_updated.connect(self.on_heading_updated)
+        self.nmea_parser.cog_updated.connect(self.on_cog_updated)
         self.nmea_parser.depth_updated.connect(self.on_depth_updated)
         self.nmea_parser.ais_updated.connect(self.on_ais_updated)
         self.nmea_parser.base_stations_updated.connect(self.on_base_stations_updated)
@@ -1540,9 +1560,7 @@ class RadarMainWindow(QMainWindow):
             self.on_spoofing_alert
         )
 
-        # Radar interface signals
-        self.radar_interface.radar_data_updated.connect(self.on_radar_data_updated)
-        self.radar_interface.transmit_state_changed.connect(self.on_transmit_state_changed)
+        # Radar interface signals are connected per driver in _switch_radar()
 
         # PPI target interaction signals
         self.ppi_display.target_selected.connect(self.on_target_selected)
@@ -1755,52 +1773,39 @@ class RadarMainWindow(QMainWindow):
         # Update EBL/VRM status bar readout (updates during drag)
         self._update_ebl_vrm_status()
 
-        # --- Alarm checks ---
-        # CPA threat alarms
-        has_critical = False
-        has_warning = False
-        for t in radar_tracks + ais_tracks:
-            risk = t.get('risk_level', 'safe')
-            if risk == 'critical':
-                has_critical = True
-            elif risk == 'warning':
-                has_warning = True
+        # --- Alarm checks (rules live in core/alarm_rules.py) ---
+        for ts, zone, tid, event in gzm.pop_new_alarms():
+            self.log_message(f"GUARD ZONE {event.upper()}: {tid} in {zone}")
 
-        if has_critical:
-            self.alarm_manager.trigger('cpa_critical', 'Collision risk detected')
-        elif has_warning:
-            self.alarm_manager.trigger('cpa_warning', 'Close approach target')
-        else:
-            self.alarm_manager.clear('cpa_critical')
-            self.alarm_manager.clear('cpa_warning')
-
-        # Guard zone intrusion alarm
-        intruded = [z for z, tgts in gzm.intrusions.items() if tgts]
-        if intruded:
-            self.alarm_manager.trigger('guard_zone',
-                                       f"Intrusion: {', '.join(intruded[:3])}")
-        else:
-            self.alarm_manager.clear('guard_zone')
-
-        # Sensor loss alarm — check for stale navigation sources
         gps_src = self.nmea_parser.active_gps_source
         hdg_src = self.nmea_parser.active_heading_source
         dep_src = self.nmea_parser.active_depth_source
         gps_active = gps_src is not None and gps_src.is_active()
         hdg_active = hdg_src is not None and hdg_src.is_active()
         dep_active = dep_src is not None and dep_src.is_active()
-        lost = []
-        if not gps_active:
-            lost.append('GPS')
-        if not hdg_active:
-            lost.append('Heading')
-        if not dep_active:
-            lost.append('Depth')
-        if lost:
-            self.alarm_manager.trigger('sensor_loss',
-                                       f"{', '.join(lost)} data offline")
-        else:
-            self.alarm_manager.clear('sensor_loss')
+
+        video_ref = max(t for t in (self._last_spoke_time, self._tx_started, 0.0)
+                        if t is not None)
+        sensors = SensorState(
+            gps_active=gps_active,
+            heading_active=hdg_active,
+            depth_active=dep_active,
+            depth_seen=self._depth_seen,
+            # Link alarm: immediately once a link has been up, otherwise after
+            # a connect grace period (SDK start-up can take several seconds)
+            radar_selected=self.radar_interface is not None and (
+                self._radar_was_connected
+                or time.monotonic() - (self._radar_started or 0.0) > self.RADAR_CONNECT_GRACE_S),
+            radar_connected=self._radar_connected,
+            radar_transmitting=self._radar_transmitting,
+            seconds_without_video=(time.monotonic() - video_ref) if video_ref else None,
+        )
+        for alarm_type, description in evaluate_alarms(
+                radar_tracks + ais_tracks, gzm.intrusions, sensors).items():
+            if description:
+                self.alarm_manager.trigger(alarm_type, description)
+            else:
+                self.alarm_manager.clear(alarm_type)
 
         # Alarm status label
         active = self.alarm_manager.active_alarms
@@ -2011,9 +2016,158 @@ class RadarMainWindow(QMainWindow):
             if cfg['name'] == name:
                 self._active_radar_config = cfg
                 self.log_message(
-                    f"Radar: {name} ({cfg.get('ip', '?')}:{cfg.get('port', '?')})"
+                    f"Radar: {name} [{cfg.get('driver', 'mock')}] "
+                    f"({cfg.get('ip', '?')}:{cfg.get('port', '?')})"
                 )
+                if self._ui_ready:
+                    self._switch_radar(cfg)
                 return
+
+    # ------------------------------------------------------------------
+    # Radar driver management
+    # ------------------------------------------------------------------
+
+    def _switch_radar(self, cfg):
+        """Tear down the current radar driver and start the one for cfg."""
+        if self.radar_interface is not None:
+            try:
+                self.radar_interface.stop()
+            except Exception as exc:
+                self.log_message(f"RADAR STOP ERROR: {exc}")
+            self.radar_interface.deleteLater()
+            self.radar_interface = None
+        self.ppi_display.clear_video()
+        self.on_transmit_state_changed(False, log=False)
+        self._clear_radar_tracks()
+        self._radar_connected = False
+        self._radar_was_connected = False
+        self._last_spoke_time = None
+        self._radar_started = time.monotonic()
+
+        if not cfg:
+            self._set_radar_status("NO RADAR", warn=True)
+            return
+        try:
+            radar = create_radar(cfg)
+        except Exception as exc:
+            self._set_radar_status("DRIVER ERROR", warn=True)
+            self.log_message(f"RADAR DRIVER ERROR: {exc}")
+            self.status_bar.showMessage(f"Radar driver error: {exc}")
+            return
+
+        radar.connection_changed.connect(self.on_radar_connection_changed)
+        radar.transmit_state_changed.connect(self.on_transmit_state_changed)
+        radar.spokes_received.connect(self.on_spokes_received)
+        radar.targets_updated.connect(self.on_radar_targets_updated)
+        radar.capabilities_changed.connect(self.on_radar_capabilities)
+        radar.error_occurred.connect(self.on_radar_error)
+        self.radar_interface = radar
+
+        self._set_radar_status("CONNECTING", warn=True)
+        try:
+            radar.start()        # non-blocking; result arrives via signals
+        except Exception as exc:
+            self.on_radar_error(str(exc))
+
+    def _clear_radar_tracks(self):
+        """Drop all radar tracks (radar changed or disconnected)."""
+        for tid in [t['id'] for t in self.track_manager.get_radar_tracks()]:
+            self.track_manager.remove_radar_track(tid)
+
+    def _radar(self, method, *args):
+        """Call a radar driver method if a driver is active."""
+        if self.radar_interface is None:
+            return None
+        try:
+            return getattr(self.radar_interface, method)(*args)
+        except Exception as exc:
+            self.log_message(f"RADAR {method} ERROR: {exc}")
+            return None
+
+    def _set_radar_status(self, text, warn=False):
+        if warn:
+            color = "#FFAA00"
+        elif hasattr(self, '_current_theme'):
+            color = self._current_theme.ui_text_primary.name()
+        else:
+            color = "#00FF00"
+        self.radar_status_label.setText(f"Status: {text}")
+        self.radar_status_label.setStyleSheet(
+            f"color: {color}; font-family: Consolas; font-size: 11px;")
+
+    def _apply_radar_settings(self):
+        """Push the current control-bar settings to a newly connected radar."""
+        self._radar('set_range', self.ppi_display.range_nm)
+        self._radar('set_gain', self.gain_slider.value())
+        self._radar('set_sea_clutter', self.sea_clutter_slider.value())
+        self._radar('set_rain_clutter', self.rain_clutter_slider.value())
+        self._radar('set_video_mode', self.video_mode_combo.currentText().lower())
+        self._feed_own_ship_to_radar()
+
+    def _feed_own_ship_to_radar(self):
+        own = self.track_manager.own_ship
+        self._radar('set_own_ship', own['lat'], own['lon'], self._own_heading,
+                    self._own_speed, self._own_course())
+
+    def on_radar_connection_changed(self, connected):
+        self._radar_connected = connected
+        self._radar_was_connected = self._radar_was_connected or connected
+        if connected:
+            self._set_radar_status("STANDBY")
+            self.log_message("RADAR CONNECTED")
+            self._apply_radar_settings()
+        else:
+            self._set_radar_status("DISCONNECTED", warn=True)
+            self.log_message("RADAR DISCONNECTED")
+            self.ppi_display.clear_video()
+            self.on_transmit_state_changed(False, log=False)
+
+    def on_radar_error(self, message):
+        self._set_radar_status("ERROR", warn=True)
+        self.log_message(f"RADAR ERROR: {message}")
+        self.status_bar.showMessage(f"Radar: {message}", 15000)
+
+    def on_radar_capabilities(self, caps):
+        """Adapt the GUI to the connected radar (range list, video resolution)."""
+        self.ppi_display.configure_video(caps.spokes_per_revolution,
+                                         caps.max_samples_per_spoke)
+        if caps.ranges_nm:
+            current = self.ppi_display.range_nm
+            self.range_combo.blockSignals(True)
+            self.range_combo.clear()
+            for r in caps.ranges_nm:
+                self.range_combo.addItem(f"{r:g} NM")
+            nearest = min(caps.ranges_nm, key=lambda r: abs(r - current))
+            self.range_combo.setCurrentText(f"{nearest:g} NM")
+            self.range_combo.blockSignals(False)
+            if nearest != current:
+                self.on_range_changed(f"{nearest:g} NM")
+        self.log_message(f"RADAR MODEL: {caps.model}")
+
+    def on_spokes_received(self, spokes):
+        self._last_spoke_time = time.monotonic()
+        self.ppi_display.add_spokes(spokes)
+
+    def on_radar_targets_updated(self, targets):
+        """Convert radar ARPA targets (bearing/range) to lat/lon track updates."""
+        own = self.track_manager.own_ship
+        lat0, lon0 = own['lat'], own['lon']
+        cos_lat = math.cos(math.radians(lat0)) or 1e-9
+        plots = []
+        for t in targets:
+            brg = t.bearing_deg if t.bearing_is_true else t.bearing_deg + self._own_heading
+            rng_nm = t.range_m / METERS_PER_NM
+            rad = math.radians(brg)
+            plots.append({
+                'id': f"R-{t.target_id}",
+                'lat': lat0 + rng_nm * math.cos(rad) / 60.0,
+                'lon': lon0 + rng_nm * math.sin(rad) / (60.0 * cos_lat),
+                'course': t.course_deg,
+                'speed': t.speed_kts,
+                'filtered': t.filtered,
+            })
+        if plots:
+            self.track_manager.update_radar_tracks(plots)
 
     # ------------------------------------------------------------------
     # Slots: control bar
@@ -2028,30 +2182,41 @@ class RadarMainWindow(QMainWindow):
             new_dists = [d * scale for d in self.ppi_display.get_range_ring_distances()]
             self.ppi_display.set_range_ring_distances(new_dists)
         self.ppi_display.set_range(new_range)
-        self.radar_interface.set_range(new_range)
+        self._radar('set_range', new_range)
 
     def on_video_mode_changed(self, mode):
-        self.radar_interface.set_video_mode(mode.lower())
+        self._radar('set_video_mode', mode.lower())
         self.ppi_display.set_video_mode(mode.lower())
 
     def on_transmit_toggled(self, checked: bool):
         """Operator pressed the STBY/TX toggle — send command to radar."""
-        self.radar_interface.set_transmit(checked)
+        if self.radar_interface is None:
+            self.on_transmit_state_changed(False, log=False)
+            return
+        self._radar('set_transmit', checked)
         # Button label and style update is handled by on_transmit_state_changed
         # which is called via the radar_interface.transmit_state_changed signal.
         # This keeps the GUI in sync with the actual hardware state rather than
         # the operator's intent, so if the SDK rejects the command the button
         # stays in its previous state.
 
-    def on_transmit_state_changed(self, transmitting: bool):
+    def on_transmit_state_changed(self, transmitting: bool, log=True):
         """Called when radar hardware confirms its transmit state."""
         # Block signals while updating button to avoid a feedback loop
+        if transmitting and not self._radar_transmitting:
+            self._tx_started = time.monotonic()
+        self._radar_transmitting = transmitting
         self.transmit_btn.blockSignals(True)
         self.transmit_btn.setChecked(transmitting)
         self.transmit_btn.blockSignals(False)
         self._apply_transmit_btn_style(transmitting)
+        if not log:
+            return
         state_str = "TRANSMIT" if transmitting else "STANDBY"
         self.log_message(f"RADAR {state_str}")
+        self._set_radar_status("TRANSMITTING" if transmitting else "STANDBY")
+        if not transmitting:
+            self.ppi_display.clear_video()
 
     def _apply_transmit_btn_style(self, transmitting: bool):
         """Apply colour coding to the TX/STBY button based on current state."""
@@ -2090,15 +2255,15 @@ class RadarMainWindow(QMainWindow):
 
     def on_gain_changed(self, value):
         self.gain_value_label.setText(f"{value}%")
-        self.radar_interface.set_gain(value)
+        self._radar('set_gain', value)
 
     def on_sea_clutter_changed(self, value):
         self.sea_clutter_value_label.setText(f"{value}%")
-        self.radar_interface.set_sea_clutter(value)
+        self._radar('set_sea_clutter', value)
 
     def on_rain_clutter_changed(self, value):
         self.rain_clutter_value_label.setText(f"{value}%")
-        self.radar_interface.set_rain_clutter(value)
+        self._radar('set_rain_clutter', value)
 
     def on_display_mode_changed(self, text):
         mode = self._DISPLAY_MODES.get(text)
@@ -2330,12 +2495,12 @@ class RadarMainWindow(QMainWindow):
             ("MMSI", str(target_data.get('mmsi', '--'))),
             ("Latitude", f"{target_data.get('lat', 0):.6f}\u00b0"),
             ("Longitude", f"{target_data.get('lon', 0):.6f}\u00b0"),
-            ("Course", f"{target_data.get('course', 0):.1f}\u00b0"),
-            ("Speed", f"{target_data.get('speed', 0):.1f} kts"),
+            ("Course", fmt_course(target_data, '.1f')),
+            ("Speed", fmt_speed(target_data)),
             ("Bearing", f"{target_data.get('bearing', 0):.1f}\u00b0"),
             ("Range", f"{target_data.get('range', 0):.2f} NM"),
-            ("CPA", f"{target_data.get('cpa', 0):.2f} NM"),
-            ("TCPA", f"{target_data.get('tcpa', 0):.1f} min"),
+            ("CPA", fmt(target_data.get('cpa'), '.2f', ' NM')),
+            ("TCPA", fmt_tcpa(target_data.get('tcpa'))),
             ("Risk Level", target_data.get('risk_level', 'safe').upper()),
             ("Classification", (target_data.get('classification') or '--').upper()),
             ("Guard Zones", ', '.join(target_data.get('guard_zones', [])) or 'CLEAR'),
@@ -2356,16 +2521,26 @@ class RadarMainWindow(QMainWindow):
     def acquire_target(self, target_data):
         """Acquire radar target for ARPA tracking."""
         target_id = target_data.get('id', '?')
-        self.log_message(f"ARPA ACQUIRE: {target_id}")
+        own = self.track_manager.own_ship
+        lat, lon = target_data.get('lat'), target_data.get('lon')
+        if lat is None or lon is None:
+            return
+        dlat = (lat - own['lat']) * 60.0
+        dlon = (lon - own['lon']) * 60.0 * math.cos(math.radians(own['lat']))
+        bearing = math.degrees(math.atan2(dlon, dlat)) % 360.0
+        range_m = math.hypot(dlat, dlon) * METERS_PER_NM
+        if self._radar('acquire_target', bearing, range_m):
+            self.log_message(f"ARPA ACQUIRE: {target_id} "
+                             f"({bearing:05.1f}\u00b0 / {range_m / METERS_PER_NM:.2f} NM)")
+        else:
+            self.log_message(f"ARPA ACQUIRE: {target_id} - not supported by radar")
 
     def cancel_track(self, target_data):
         """Cancel tracking of a radar target."""
         target_id = target_data.get('id')
         if target_id and target_id in self.track_manager.radar_tracks:
-            del self.track_manager.radar_tracks[target_id]
-            self.track_manager.track_history.pop(target_id, None)
-            self.track_manager.track_filters.pop(target_id, None)
-            self.track_manager.target_classifications.pop(target_id, None)
+            self._radar('cancel_target', target_id)
+            self.track_manager.remove_radar_track(target_id)
             self.log_message(f"TRACK CANCELLED: {target_id}")
             # Deselect if this was the selected target
             if self.ppi_display.selected_target_id == target_id:
@@ -2509,7 +2684,9 @@ class RadarMainWindow(QMainWindow):
 
         # Propagate to track manager for CPA calculations
         self._own_speed = speed
-        self.track_manager.update_own_ship(lat, lon, self._own_heading, speed)
+        self.track_manager.update_own_ship(lat, lon, self._own_course(), speed,
+                                           heading=self._own_heading)
+        self._feed_own_ship_to_radar()
 
         # Keep ADS-B receiver updated so relative positions convert correctly
         self.adsb_receiver.set_own_position(lat, lon)
@@ -2518,17 +2695,40 @@ class RadarMainWindow(QMainWindow):
         self.heading_label.setText(f"HDG:  {heading:05.1f}\u00b0")
         self.ppi_display.set_own_ship_heading(heading)
 
-        # Use heading as course for Course-Up and CPA until separate course source exists
         self._own_heading = heading
-        self.ppi_display.own_course = heading
+        self.ppi_display.own_course = self._own_course()
         self.track_manager.update_own_ship(
             self.track_manager.own_ship['lat'],
             self.track_manager.own_ship['lon'],
-            heading,
+            self._own_course(),
             self._own_speed,
+            heading=heading,
         )
+        self._feed_own_ship_to_radar()
+
+    RADAR_CONNECT_GRACE_S = 15.0
+    COG_MIN_SPEED_KTS = 0.5     # below this COG is noise; use heading
+    COG_MAX_AGE_S = 10.0
+
+    def _own_course(self):
+        """Course for CPA: course over ground when fresh and the ship is
+        moving (set and leeway make heading wrong for CPA), else heading."""
+        if (self._own_cog is not None and self._own_cog_time is not None
+                and time.monotonic() - self._own_cog_time < self.COG_MAX_AGE_S
+                and self._own_speed >= self.COG_MIN_SPEED_KTS):
+            return self._own_cog
+        return self._own_heading
+
+    def on_cog_updated(self, cog, sog):
+        self._own_cog = cog
+        self._own_cog_time = time.monotonic()
+        own = self.track_manager.own_ship
+        self.ppi_display.own_course = self._own_course()
+        self.track_manager.update_own_ship(own['lat'], own['lon'], self._own_course(),
+                                           self._own_speed, heading=self._own_heading)
 
     def on_depth_updated(self, depth, source_name):
+        self._depth_seen = True
         self.depth_label.setText(f"DEPTH: {depth:.1f} m")
 
     def on_stw_updated(self, stw):
@@ -2559,10 +2759,10 @@ class RadarMainWindow(QMainWindow):
         for i, ais in enumerate(ais_targets[:10]):
             name = ais.get('name', 'Unknown')[:15]
             mmsi = ais.get('mmsi', '000000000')
-            cog = ais.get('course', 0)
-            sog = ais.get('speed', 0)
+            cog = fmt(ais.get('course'), '05.1f', '\u00b0')
+            sog = fmt(ais.get('speed'), '04.1f', 'kts')
             ais_text += f"{i+1:02d}  {name:15s} {mmsi}\n"
-            ais_text += f"    COG:{cog:05.1f}\u00b0 SOG:{sog:04.1f}kts\n"
+            ais_text += f"    COG:{cog} SOG:{sog}\n"
         self.ais_list.setPlainText(ais_text)
         if (self._ais_targets_dialog is not None
                 and self._ais_targets_dialog.isVisible()):
@@ -2584,23 +2784,6 @@ class RadarMainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Slots: radar data
     # ------------------------------------------------------------------
-
-    def on_radar_data_updated(self, radar_data):
-        self.ppi_display.update_radar_data(radar_data)
-
-        self.radar_status_label.setText("Status: OPERATING")
-        self.radar_status_label.setStyleSheet(
-            f"color: {self._current_theme.ui_text_primary.name()}; "
-            "font-family: Consolas; font-size: 11px;"
-        )
-
-        if radar_data.get('targets'):
-            self.track_manager.update_radar_tracks(radar_data['targets'])
-
-        # Log guard zone intrusions
-        for alarm in self.track_manager.guard_zone_manager.get_recent_alarms(3):
-            ts, zone, tid, event = alarm
-            self.log_message(f"GUARD ZONE {event.upper()}: {tid} in {zone}")
 
     # ------------------------------------------------------------------
     # Camera slots & helpers
@@ -2653,7 +2836,7 @@ class RadarMainWindow(QMainWindow):
         self.alarm_manager.silence()
 
         # Stop radar, NMEA, camera, and ADS-B
-        self.radar_interface.stop()
+        self._radar('stop')
         self.nmea_parser.stop_listening()
         self.camera_controller.stop_listening()
         self.adsb_receiver.stop_listening()

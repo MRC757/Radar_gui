@@ -6,50 +6,47 @@ Main application entry point
 
 import sys
 import signal
-import subprocess
 import importlib
 
 
 # ---------------------------------------------------------------------------
-# Dependency check — install missing packages from requirements.txt
+# Dependency check — report missing packages; never install automatically.
+# (Installing packages at start-up on a bridge system is a supply-chain risk
+# and changes the software without the operator's knowledge.)
 # ---------------------------------------------------------------------------
 
 REQUIRED_PACKAGES = [
     ("PyQt6", "PyQt6"),       # (import_name, pip_name)
     ("numpy", "numpy"),
 ]
+OPTIONAL_PACKAGES = [
+    ("cryptography", "cryptography", "encrypted AIS decryption"),
+]
 
 
 def check_dependencies():
-    """Check for required packages and install any that are missing."""
+    """Return True if all required packages are importable."""
     missing = []
     for import_name, pip_name in REQUIRED_PACKAGES:
         try:
             importlib.import_module(import_name)
         except ImportError:
-            missing.append((import_name, pip_name))
+            missing.append(pip_name)
+
+    for import_name, pip_name, feature in OPTIONAL_PACKAGES:
+        try:
+            importlib.import_module(import_name)
+        except ImportError:
+            print(f"[startup] Optional package '{pip_name}' not installed — "
+                  f"{feature} disabled.")
 
     if not missing:
         return True
 
-    names = ", ".join(pip for _, pip in missing)
-    print(f"[startup] Missing dependencies: {names}")
-    print("[startup] Installing missing packages...")
-
-    pip_args = [sys.executable, "-m", "pip", "install"]
-    for _, pip_name in missing:
-        pip_args.append(pip_name)
-
-    try:
-        subprocess.check_call(pip_args)
-        print("[startup] Dependencies installed successfully.")
-        return True
-    except subprocess.CalledProcessError as exc:
-        print(f"[startup] Failed to install dependencies: {exc}")
-        print("[startup] Please install manually:  pip install " + " ".join(
-            pip for _, pip in missing
-        ))
-        return False
+    print(f"[startup] Missing required packages: {', '.join(missing)}")
+    print("[startup] Install the tested versions with:")
+    print(f"[startup]     {sys.executable} -m pip install -r requirements.txt")
+    return False
 
 
 # ---------------------------------------------------------------------------

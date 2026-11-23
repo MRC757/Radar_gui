@@ -63,6 +63,7 @@ class BITWindow(QDialog):
 
     # (internal key, display label)
     _FAULT_DEFS = [
+        ("radar_link",     "RADAR LINK"),
         ("transmitter",    "TRANSMITTER"),
         ("motor",          "ANTENNA MOTOR"),
         ("over_temp",      "OVER TEMPERATURE"),
@@ -226,17 +227,20 @@ class BITWindow(QDialog):
     def _poll_status(self):
         """Poll live subsystem status from radar interface and NMEA parser."""
         # Radar interface status
-        if self._radar is not None:
-            status = {}
-            if hasattr(self._radar, 'get_status'):
-                status = self._radar.get_status()
-            self.set_fault("transmitter",  status.get("transmitter_fault", False))
-            self.set_fault("motor",        status.get("motor_fault", False))
-            self.set_fault("over_temp",    status.get("over_temp", False))
-            self.set_fault("receiver",     status.get("receiver_fault", False))
-            self.set_fault("power_supply", status.get("power_supply_fault", False))
-            self.set_fault("signal_proc",  status.get("signal_proc_fault", False))
-            self.set_fault("display",      status.get("display_fault", False))
+        status = {}
+        if self._radar is None:
+            self.set_fault("radar_link", True)
+        else:
+            radar_status = self._radar.get_status()      # core.radar.RadarStatus
+            status = radar_status.fault_dict()
+            self.set_fault("radar_link", not radar_status.connected)
+        self.set_fault("transmitter",  status.get("transmitter_fault", False))
+        self.set_fault("motor",        status.get("motor_fault", False))
+        self.set_fault("over_temp",    status.get("over_temp", False))
+        self.set_fault("receiver",     status.get("receiver_fault", False))
+        self.set_fault("power_supply", status.get("power_supply_fault", False))
+        self.set_fault("signal_proc",  status.get("signal_proc_fault", False))
+        self.set_fault("display",      status.get("display_fault", False))
 
         # NMEA input status
         if self._nmea is not None:
@@ -268,6 +272,22 @@ class BITWindow(QDialog):
     def _run_full_test(self):
         """Run a full built-in test sequence."""
         self._log("--- FULL BIT INITIATED ---")
+
+        # Radar hardware details (from the SDK driver)
+        if self._radar is not None:
+            st = self._radar.get_status()
+            caps = self._radar.get_capabilities()
+            self._log(f"  RADAR: {caps.model}  link={'UP' if st.connected else 'DOWN'}  "
+                      f"{'TX' if st.transmitting else 'STBY'}")
+            if st.firmware_version or st.serial_number:
+                self._log(f"  FW {st.firmware_version or '?'}  S/N {st.serial_number or '?'}")
+            if st.operating_hours is not None:
+                self._log(f"  Hours: operating {st.operating_hours:.0f}  "
+                          f"transmit {st.transmit_hours or 0:.0f}")
+            if st.temperature_c is not None:
+                self._log(f"  Temperature: {st.temperature_c:.1f} C")
+        else:
+            self._log("  FAIL: No radar driver active")
 
         # Software self-tests with detail
         cfg_ok = self._check_config_files()

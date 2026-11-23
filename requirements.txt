@@ -1,3 +1,5 @@
-PyQt6>=6.4.0
-numpy>=1.24.0
-cryptography>=42.0.0
+# Versions bounded to the major releases this application is tested with
+# (PyQt6 6.10, numpy 2.2, cryptography 46). Raise the upper bounds only after testing.
+PyQt6>=6.4,<7
+numpy>=1.24,<3
+cryptography>=42,<47

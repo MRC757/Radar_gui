@@ -130,6 +130,8 @@ def _build_alarm_wavs():
         'gps_spoofing': lambda d: _make_warble(2200, 1400, d['dur']),
         'sensor_loss':  lambda d: _make_tone(d['freq'], d['dur']),
         'anchor_drag':  lambda d: _make_double_beep(d['freq'], d['dur']),
+        'radar_link':   lambda d: _make_warble(1300, 900, d['dur']),
+        'radar_video':  lambda d: _make_tone(d['freq'], d['dur']),
     }
     for atype, defn in ALARM_DEFS.items():
         builder = defs.get(atype)
@@ -151,6 +153,10 @@ ALARM_DEFS = {
                      'label': 'SENSOR LOSS'},
     'anchor_drag':  {'freq': 1000, 'dur': 400, 'interval': 3.0,
                      'label': 'ANCHOR DRAG'},
+    'radar_link':   {'freq': 1100, 'dur': 400, 'interval': 2.0,
+                     'label': 'RADAR LINK'},
+    'radar_video':  {'freq': 1100, 'dur': 300, 'interval': 2.0,
+                     'label': 'NO RADAR VIDEO'},
 }
 
 # Default descriptions when none is provided
@@ -161,6 +167,8 @@ _DEFAULT_DESCRIPTIONS = {
     'gps_spoofing': 'Position anomaly detected',
     'sensor_loss':  'Navigation data offline',
     'anchor_drag':  'Ship dragging anchor — outside swing radius',
+    'radar_link':   'Radar connection lost',
+    'radar_video':  'Transmitting but no radar video received',
 }
 
 # Pre-build WAV audio at module load
@@ -242,8 +250,7 @@ class AlarmManager:
                 # --- New alarm condition ---
                 entry = AlarmEntry(alarm_type, description)
                 self._entries.insert(0, entry)
-                if len(self._entries) > self.MAX_ENTRIES:
-                    self._entries = self._entries[:self.MAX_ENTRIES]
+                self._trim_entries()
                 logger.info("Alarm raised: %s — %s", alarm_type, description)
                 self._write_log("TRIGGERED", alarm_type, description)
             else:
@@ -338,6 +345,20 @@ class AlarmManager:
                 f.write(line)
         except Exception as exc:
             logger.debug("Alarm log write failed: %s", exc)
+
+    def _trim_entries(self):
+        """Keep at most MAX_ENTRIES, dropping the oldest INACTIVE entries
+        first.  Active entries are never dropped — losing one would make the
+        next trigger() create a fresh, un-silenced duplicate."""
+        excess = len(self._entries) - self.MAX_ENTRIES
+        if excess <= 0:
+            return
+        for i in range(len(self._entries) - 1, -1, -1):
+            if excess == 0:
+                break
+            if not self._entries[i].active:
+                del self._entries[i]
+                excess -= 1
 
     def _find_active_entry(self, alarm_type: str):
         """Find the currently active entry for *alarm_type*, if any."""

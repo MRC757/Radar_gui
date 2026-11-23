@@ -92,7 +92,7 @@ class PerformanceMonitor(QObject):
             
             self.cpu_history.append(cpu_percent)
             self.memory_history.append(memory_mb)
-        except:
+        except Exception:   # psutil unavailable / access denied
             cpu_percent = 0
             memory_mb = 0
         

@@ -7,6 +7,8 @@ IMO ARPA compliant: shows CPA, TCPA, bearing, range, course, speed, risk.
 from PyQt6.QtWidgets import QGroupBox, QLabel, QGridLayout
 from PyQt6.QtGui import QFont
 
+from gui.formatting import fmt, fmt_course, fmt_speed, fmt_tcpa
+
 
 class SelectedTargetPanel(QGroupBox):
     """Panel showing full data for the currently selected target"""
@@ -63,12 +65,12 @@ class SelectedTargetPanel(QGroupBox):
         self._fields['mmsi_label'].setText(str(data.get('mmsi', '--')))
         self._fields['lat_label'].setText(f"{data.get('lat', 0):.6f}")
         self._fields['lon_label'].setText(f"{data.get('lon', 0):.6f}")
-        self._fields['cog_label'].setText(f"{data.get('course', 0):.1f}\u00b0")
-        self._fields['sog_label'].setText(f"{data.get('speed', 0):.1f} kts")
+        self._fields['cog_label'].setText(fmt_course(data, '.1f'))
+        self._fields['sog_label'].setText(fmt_speed(data))
         self._fields['brg_label'].setText(f"{data.get('bearing', 0):.1f}\u00b0")
         self._fields['rng_label'].setText(f"{data.get('range', 0):.2f} NM")
-        self._fields['cpa_label'].setText(f"{data.get('cpa', 0):.2f} NM")
-        self._fields['tcpa_label'].setText(f"{data.get('tcpa', 0):.1f} min")
+        self._fields['cpa_label'].setText(fmt(data.get('cpa'), '.2f', ' NM'))
+        self._fields['tcpa_label'].setText(fmt_tcpa(data.get('tcpa')))
 
         risk = data.get('risk_level', 'safe')
         self._fields['risk_label'].setText(risk.upper())

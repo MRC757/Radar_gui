@@ -261,6 +261,13 @@ class AnchorWatchDialog(QDialog):
         if not self.active:
             return
 
+        # With no live GPS the position is frozen: say so, and leave any
+        # existing drag alarm as it is rather than clearing it on stale data.
+        gps = getattr(self._parser, 'active_gps_source', None)
+        if gps is None or not gps.is_active():
+            self._set_status("\u26a0 NO GPS \u2014 NOT MONITORING", "#ffaa00")
+            return
+
         lat = self._parser.latitude
         lon = self._parser.longitude
         drift_nm = self._track_manager.calculate_distance(

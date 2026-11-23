@@ -25,7 +25,7 @@ import math
 import os
 import socket
 import threading
-from datetime import datetime
+import time
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
@@ -158,7 +158,7 @@ class AdsbReceiver(QObject):
             if src.socket:
                 try:
                     src.socket.close()
-                except Exception:
+                except OSError:
                     pass
         logger.info("ADS-B: listener stopped")
 
@@ -189,8 +189,7 @@ class AdsbReceiver(QObject):
                     sentence = line.strip()
                     if sentence:
                         self.parse_sentence(sentence, source)
-                        source.last_data_time = datetime.now()
-                        source.data_count += 1
+                        source.mark_data()
             except socket.timeout:
                 continue
             except Exception as exc:
@@ -207,10 +206,18 @@ class AdsbReceiver(QObject):
         """Dispatch a raw NMEA sentence to the appropriate handler."""
         if not sentence.startswith('$'):
             return
-        # Strip checksum
+        # Verify and strip checksum (corrupted serial data must not plot)
         core = sentence[1:]
         if '*' in core:
-            core = core[:core.index('*')]
+            star = core.index('*')
+            body, given = core[:star], core[star + 1:star + 3]
+            calc = 0
+            for ch in body:
+                calc ^= ord(ch)
+            if f"{calc:02X}" != given.upper():
+                logger.debug("ADS-B checksum mismatch: %r", sentence)
+                return
+            core = body
         parts = core.split(',')
         if not parts:
             return
@@ -257,13 +264,13 @@ class AdsbReceiver(QObject):
         own_lat = self.own_lat
         own_lon = self.own_lon
         if own_lat == 0.0 and own_lon == 0.0:
-            # Own position not yet known — still store with placeholder coords
-            tgt_lat = 0.0
-            tgt_lon = 0.0
-        else:
-            tgt_lat = own_lat + rel_north / 111320.0
-            cos_lat = math.cos(math.radians(own_lat))
-            tgt_lon = own_lon + rel_east / (111320.0 * cos_lat if cos_lat else 1.0)
+            # Own position not yet known — the target can't be placed, so
+            # don't store it (it would otherwise be plotted at 0°N 0°E).
+            logger.debug("PFLAA %s ignored: own position unknown", icao_id)
+            return
+        tgt_lat = own_lat + rel_north / 111320.0
+        cos_lat = math.cos(math.radians(own_lat))
+        tgt_lon = own_lon + rel_east / (111320.0 * cos_lat if cos_lat else 1.0)
 
         speed_kts = speed_ms * 1.94384
 
@@ -277,7 +284,7 @@ class AdsbReceiver(QObject):
             'speed_kts':     speed_kts,
             'alarm_level':   alarm_level,
             'aircraft_type': aircraft_type,
-            'last_update':   datetime.now(),
+            'last_update':   time.monotonic(),
         }
 
         with self._lock:
@@ -315,12 +322,12 @@ class AdsbReceiver(QObject):
             self._prune_stale()
 
     def _prune_stale(self):
-        now = datetime.now()
+        now = time.monotonic()
         pruned = False
         with self._lock:
             stale = [
                 k for k, v in self._targets.items()
-                if (now - v['last_update']).total_seconds() > _STALE_SECONDS
+                if now - v['last_update'] > _STALE_SECONDS
             ]
             for k in stale:
                 del self._targets[k]

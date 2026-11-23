@@ -267,7 +267,7 @@ gui/anchor_watch_dialog.py       — Anchor Watch popup
 core/multi_source_nmea_parser.py — Multi-source NMEA-0183 parser + AIS decoder
 core/adsb_receiver.py            — ADS-B / FLARM receiver ($PFLAA / $PFLAU)
 core/camera_controller.py        — PTZ camera NMEA slew commands + azimuth parsing
-core/radar_interface.py          — Abstract radar API + mock (SDK integration point)
+core/radar/                      — Radar driver layer: RadarInterface, simulator, Furuno SDK driver
 core/ais_decrypt.py              — AES-CBC decryption for Secure AIS
 core/alarm_manager.py            — Audible alarm controller (WAV synthesis)
 core/track_manager.py            — Track correlation, CPA/TCPA, classification, trails
@@ -293,6 +293,6 @@ Once the application works with simulated data:
 2. **Connect ADS-B receiver** — Settings > NMEA Sources > ADS-B Sources; point receiver output at port 10117
 3. **Configure PTZ camera** — Settings > NMEA Sources > Camera Control; set host, ports, bearing mode, and message template
 4. **Add SA-AIS encryption keys** — Settings > Encrypted AIS Keys (if using Secure AIS)
-5. **Integrate Radar SDK** — See README.md; implement `RadarInterface` subclass and connect `set_transmit()` / `transmit_state_changed`
+5. **Integrate Radar SDK** — See README.md "Furuno SDK DLLs": install the DLLs under `radar_sdk/furuno/`, add a `furuno` radar in Settings > Radar, and match `core/radar/furuno/bindings.py` to the SDK header
 6. **Customize guard zones** — Settings > Guard Zones
 7. **Adjust CPA/TCPA thresholds** — Settings > CPA/TCPA Thresholds

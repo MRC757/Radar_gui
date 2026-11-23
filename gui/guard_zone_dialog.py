@@ -5,7 +5,7 @@ Allows adding, editing, and removing guard zones for intrusion detection.
 
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QGroupBox,
                              QPushButton, QLabel, QLineEdit, QDoubleSpinBox,
-                             QTableWidget, QHeaderView, QCheckBox,
+                             QTableWidget, QHeaderView, QCheckBox, QComboBox,
                              QMessageBox, QWidget)
 from PyQt6.QtCore import Qt
 
@@ -32,7 +32,8 @@ class GuardZoneDialog(QDialog):
         # Info
         info = QLabel(
             "Configure guard zones around own ship. An alarm is triggered "
-            "when a target enters or exits a zone."
+            "when a target enters or exits a zone. 'Relative' zones are measured "
+            "from the bow and turn with the ship; 'True' zones are fixed to north."
         )
         info.setWordWrap(True)
         info.setObjectName("info_label")
@@ -40,14 +41,14 @@ class GuardZoneDialog(QDialog):
 
         # Zone table
         self.table = QTableWidget()
-        self.table.setColumnCount(7)
+        self.table.setColumnCount(8)
         self.table.setHorizontalHeaderLabels([
             "Name", "Start Angle", "End Angle",
-            "Inner Range (NM)", "Outer Range (NM)", "Enabled", "Actions"
+            "Inner Range (NM)", "Outer Range (NM)", "Reference", "Enabled", "Actions"
         ])
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for col in range(1, 7):
+        for col in range(1, 8):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self.table)
 
@@ -79,9 +80,10 @@ class GuardZoneDialog(QDialog):
             self._insert_zone_row(
                 zone.name, zone.start_angle, zone.end_angle,
                 zone.inner_range, zone.outer_range, zone.enabled,
+                getattr(zone, 'relative', True),
             )
 
-    def _insert_zone_row(self, name, start, end, inner, outer, enabled):
+    def _insert_zone_row(self, name, start, end, inner, outer, enabled, relative=True):
         row = self.table.rowCount()
         self.table.insertRow(row)
 
@@ -116,6 +118,11 @@ class GuardZoneDialog(QDialog):
         outer_spin.setValue(outer)
         self.table.setCellWidget(row, 4, outer_spin)
 
+        ref_combo = QComboBox()
+        ref_combo.addItems(["Relative (bow)", "True (north)"])
+        ref_combo.setCurrentIndex(0 if relative else 1)
+        self.table.setCellWidget(row, 5, ref_combo)
+
         enabled_cb = QCheckBox()
         enabled_cb.setChecked(enabled)
         cb_container = QWidget()
@@ -123,11 +130,11 @@ class GuardZoneDialog(QDialog):
         cb_layout.addWidget(enabled_cb)
         cb_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         cb_layout.setContentsMargins(0, 0, 0, 0)
-        self.table.setCellWidget(row, 5, cb_container)
+        self.table.setCellWidget(row, 6, cb_container)
 
         delete_btn = QPushButton("Delete")
         delete_btn.clicked.connect(lambda _, r=row: self._delete_row(r))
-        self.table.setCellWidget(row, 6, delete_btn)
+        self.table.setCellWidget(row, 7, delete_btn)
 
     def _add_empty_zone(self):
         count = self.table.rowCount() + 1
@@ -142,7 +149,7 @@ class GuardZoneDialog(QDialog):
             for r in range(self.table.rowCount()):
                 btn = QPushButton("Delete")
                 btn.clicked.connect(lambda _, r2=r: self._delete_row(r2))
-                self.table.setCellWidget(r, 6, btn)
+                self.table.setCellWidget(r, 7, btn)
 
     # ------------------------------------------------------------------
 
@@ -169,7 +176,8 @@ class GuardZoneDialog(QDialog):
                 )
                 return
 
-            cb_container = self.table.cellWidget(row, 5)
+            relative = self.table.cellWidget(row, 5).currentIndex() == 0
+            cb_container = self.table.cellWidget(row, 6)
             enabled = cb_container.findChild(QCheckBox).isChecked()
 
             new_zones.append(GuardZone(
@@ -180,6 +188,7 @@ class GuardZoneDialog(QDialog):
                 outer_range=outer,
                 enabled=enabled,
                 alarm_on_entry=True,
+                relative=relative,
             ))
 
         # Replace zones in the manager

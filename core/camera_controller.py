@@ -123,8 +123,12 @@ class CameraController(QObject):
             try:
                 with open(_CONFIG_FILE, 'r') as fh:
                     data = json.load(fh)
-            except Exception:
-                pass
+            except (OSError, ValueError) as exc:
+                # Do NOT continue: writing now would replace the whole file
+                # with only the camera section and wipe the NMEA source config.
+                logger.error("Camera config not saved — cannot read %s: %s",
+                             _CONFIG_FILE, exc)
+                return
         data['camera'] = self.config
         try:
             with open(_CONFIG_FILE, 'w') as fh:
@@ -176,18 +180,25 @@ class CameraController(QObject):
         # Strip leading $
         if sentence.startswith('$'):
             sentence = sentence[1:]
-        # Strip trailing *CHECKSUM
+        # Verify and strip trailing *CHECKSUM
         if '*' in sentence:
-            sentence = sentence[:sentence.index('*')]
+            star = sentence.index('*')
+            body, given = sentence[:star], sentence[star + 1:star + 3]
+            if given and nmea_checksum(body).upper() != given.upper():
+                return None
+            sentence = body
 
         parts = sentence.split(',')
         if not parts or parts[0] != resp_hdr:
             return None
 
         try:
-            return float(parts[field_idx])
+            azimuth = float(parts[field_idx])
         except (IndexError, ValueError):
             return None
+        if not math.isfinite(azimuth):
+            return None
+        return azimuth % 360.0
 
     # ------------------------------------------------------------------
     # Send command
@@ -236,7 +247,7 @@ class CameraController(QObject):
         if self._sock_recv:
             try:
                 self._sock_recv.close()
-            except Exception:
+            except OSError:
                 pass
 
     def _listen_loop(self):

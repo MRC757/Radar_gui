@@ -25,6 +25,8 @@ _ALARM_COLORS = {
     'guard_zone':   '#FFD700',
     'gps_spoofing': '#FF00FF',
     'sensor_loss':  '#00BFFF',
+    'radar_link':   '#00BFFF',
+    'radar_video':  '#00BFFF',
 }
 
 

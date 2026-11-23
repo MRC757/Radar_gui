@@ -58,13 +58,15 @@ class RadarTestScenarios:
         
         return TestScenario(
             name="Crossing Scenario",
-            description="Target crossing ahead from port to starboard",
+            description="Southbound target on the port bow passes astern",
             own_ship=own_ship,
             targets=[target],
             expected_results={
-                'cpa_nm': 0.8,      # Expected CPA ~0.8 NM
-                'tcpa_min': 12.0,   # Expected TCPA ~12 minutes
-                'risk_level': 'warning'
+                # Hand-checked: rel pos (-2.396, 3.0) NM, rel vel (-10, -12) kn
+                # -> TCPA = 12.04/244 h = 2.96 min, CPA point (-2.889, 2.408) = 3.76 NM
+                'cpa_nm': 3.76,
+                'tcpa_min': 2.96,
+                'risk_level': 'safe'
             }
         )
     
@@ -98,7 +100,8 @@ class RadarTestScenarios:
             expected_results={
                 'cpa_nm': 0.0,      # Direct collision course
                 'tcpa_min': 14.4,   # 6 NM / 25 knots = 0.24 hr = 14.4 min
-                'risk_level': 'critical'
+                # TCPA is outside the 12-min threat gate, so not yet a threat
+                'risk_level': 'safe'
             }
         )
     
@@ -130,9 +133,11 @@ class RadarTestScenarios:
             own_ship=own_ship,
             targets=[target],
             expected_results={
-                'cpa_nm': 0.0,      # On same track
-                'tcpa_min': 42.0,   # Time to catch up
-                'risk_level': 'caution'
+                # Target bears 038.6 deg, not on own 045 track: offset 0.43 NM.
+                # Along-track 3.815 NM closing at 7 kn -> 32.7 min.
+                'cpa_nm': 0.43,
+                'tcpa_min': 32.7,
+                'risk_level': 'safe'
             }
         )
     
@@ -165,7 +170,9 @@ class RadarTestScenarios:
             targets=[target],
             expected_results={
                 'cpa_nm': 6.0,      # Maintains 6 NM separation
-                'tcpa_min': float('inf'),  # No CPA event
+                # Target starts 2.4 NM astern-abeam and is 2 kn faster: it is
+                # abeam (CPA) after 2.396 NM / 2 kn = 72 min
+                'tcpa_min': 71.9,
                 'risk_level': 'safe'
             }
         )
@@ -309,8 +316,9 @@ class ScenarioRunner:
             actual_cpa = results['targets'][0]['cpa_nm']
             expected_cpa = expected['cpa_nm']
             
-            # Allow 20% tolerance
-            tolerance = expected_cpa * 0.2
+            # 20% tolerance, but never less than 0.05 NM (a 20% band
+            # around an expected CPA of 0 would be zero-width)
+            tolerance = max(expected_cpa * 0.2, 0.05)
             if abs(actual_cpa - expected_cpa) > tolerance:
                 errors.append(
                     f"CPA mismatch: expected {expected_cpa:.2f}, got {actual_cpa:.2f}"
@@ -326,12 +334,18 @@ class ScenarioRunner:
                     f"TCPA mismatch: expected infinite, got {actual_tcpa:.2f}"
                 )
             elif not math.isinf(expected_tcpa):
-                tolerance = expected_tcpa * 0.2
+                tolerance = max(expected_tcpa * 0.2, 0.5)
                 if abs(actual_tcpa - expected_tcpa) > tolerance:
                     errors.append(
                         f"TCPA mismatch: expected {expected_tcpa:.2f}, got {actual_tcpa:.2f}"
                     )
-                    
+
+        if 'risk_level' in expected:
+            actual_risk = results['targets'][0]['risk_level']
+            if actual_risk != expected['risk_level']:
+                errors.append(f"Risk mismatch: expected {expected['risk_level']}, "
+                              f"got {actual_risk}")
+
         passed = len(errors) == 0
         
         return passed, results, errors
@@ -359,7 +373,10 @@ class ScenarioRunner:
         return all_passed, summary
         
     def print_summary(self, summary):
-        """Print test summary"""
+        """Print test summary.  Accepts the (all_passed, summary) tuple
+        returned by run_all_scenarios() or just the summary list."""
+        if isinstance(summary, tuple):
+            summary = summary[1]
         logger.info("=" * 60)
         logger.info("Test Scenario Results")
         logger.info("=" * 60)

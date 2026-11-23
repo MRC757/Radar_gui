@@ -40,3 +40,12 @@ nmea_config.json
 *.spec
 *.exe
 *.msi
+
+# Licensed radar SDK files (never commit vendor DLLs/headers)
+radar_sdk/
+
+# Fake SDK build outputs
+tests/fake_sdk/*.dll
+tests/fake_sdk/*.obj
+tests/fake_sdk/*.lib
+tests/fake_sdk/*.exp

@@ -25,20 +25,16 @@ class KalmanTrackFilter:
             measurement_noise: Measurement noise standard deviation (meters)
         """
         self.dt = dt
-        
+        self._q = process_noise ** 2
+
         # State vector [x, y, vx, vy]
         self.x = np.zeros(4)
         
         # State covariance matrix
         self.P = np.eye(4) * 1000  # High initial uncertainty
         
-        # State transition matrix (constant velocity model)
-        self.F = np.array([
-            [1, 0, dt, 0],
-            [0, 1, 0, dt],
-            [0, 0, 1, 0],
-            [0, 0, 0, 1]
-        ])
+        # State transition / process noise (constant velocity model)
+        self._set_dt(dt)
         
         # Measurement matrix (we measure position only)
         self.H = np.array([
@@ -46,15 +42,7 @@ class KalmanTrackFilter:
             [0, 1, 0, 0]
         ])
         
-        # Process noise covariance
-        q = process_noise ** 2
-        self.Q = np.array([
-            [q*dt**4/4, 0, q*dt**3/2, 0],
-            [0, q*dt**4/4, 0, q*dt**3/2],
-            [q*dt**3/2, 0, q*dt**2, 0],
-            [0, q*dt**3/2, 0, q*dt**2]
-        ])
-        
+
         # Measurement noise covariance
         r = measurement_noise ** 2
         self.R = np.array([
@@ -69,8 +57,32 @@ class KalmanTrackFilter:
         self.x = np.array([x, y, vx, vy])
         self.initialized = True
         
-    def predict(self):
-        """Predict next state"""
+    def _set_dt(self, dt):
+        """Rebuild F and Q for a time step of dt seconds."""
+        self.dt = dt
+        q = self._q
+        self.F = np.array([
+            [1, 0, dt, 0],
+            [0, 1, 0, dt],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ])
+        self.Q = np.array([
+            [q*dt**4/4, 0, q*dt**3/2, 0],
+            [0, q*dt**4/4, 0, q*dt**3/2],
+            [q*dt**3/2, 0, q*dt**2, 0],
+            [0, q*dt**3/2, 0, q*dt**2]
+        ])
+
+    def predict(self, dt=None):
+        """Predict the state dt seconds ahead.
+
+        Pass the ACTUAL time since the previous update — measurements do not
+        arrive at a fixed rate, and a wrong dt scales the velocity estimate
+        (and therefore speed, course and CPA) by the same error.
+        """
+        if dt is not None and dt > 0 and dt != self.dt:
+            self._set_dt(dt)
         # Predict state
         self.x = self.F @ self.x
         

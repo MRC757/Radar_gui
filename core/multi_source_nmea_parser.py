@@ -49,11 +49,16 @@ class NMEASource:
     def ip(self, value):
         self.listen_address = value
 
+    def mark_data(self):
+        """Record that data arrived (monotonic clock — immune to clock changes)."""
+        self.last_data_time = time.monotonic()
+        self.data_count += 1
+
     def is_active(self, timeout_seconds=5):
         """Check if source is active (received data recently)"""
         if not self.last_data_time:
             return False
-        return (datetime.now() - self.last_data_time).total_seconds() < timeout_seconds
+        return (time.monotonic() - self.last_data_time) < timeout_seconds
 
 
 class MultiSourceNMEAParser(QObject):
@@ -72,6 +77,16 @@ class MultiSourceNMEAParser(QObject):
     stw_updated = pyqtSignal(float)  # speed through water in knots
     sentence_received = pyqtSignal(str, str)  # source_name, raw_sentence
     base_stations_updated = pyqtSignal(list)  # list of AIS base station dicts (Type 4)
+    cog_updated = pyqtSignal(float, float)  # course over ground (deg true), SOG (kts)
+
+    # AIS target lifetime.  A Class A ship at anchor reports every 3 min and a
+    # Class B unit can be similar, so a target with no position report for
+    # 6 min is considered lost and removed (it would otherwise be frozen at
+    # its last position while CPA is computed against it).
+    AIS_TARGET_TIMEOUT_S = 360.0
+    AIS_STATIC_TIMEOUT_S = 1800.0
+    AIS_BASE_STATION_TIMEOUT_S = 600.0
+    AIS_PUBLISH_INTERVAL_S = 1.0
     
     def __init__(self):
         super().__init__()
@@ -102,6 +117,11 @@ class MultiSourceNMEAParser(QObject):
         self.water_temp = 0.0       # Celsius (from MTW)
         self.ais_targets = {}
         self.ais_base_stations = {}   # mmsi -> dict (Type 4 messages; never passed to track manager)
+        self._ais_static = {}         # mmsi -> static/voyage data, merged into position reports
+        self._ais_dirty = False       # True when targets changed since last publish
+        self._base_dirty = False
+        self.magnetic_variation = None  # degrees (+E / -W) from RMC, used by HDG
+        self._warned_no_variation = False
         self._ais_lock = threading.Lock()
 
         # Encrypted AIS decryptor
@@ -211,6 +231,12 @@ class MultiSourceNMEAParser(QObject):
         )
         monitor_thread.start()
         self.threads.append(monitor_thread)
+
+        # AIS publisher: prunes lost targets and publishes at most once per
+        # AIS_PUBLISH_INTERVAL_S, instead of once per received AIS message.
+        ais_thread = threading.Thread(target=self._ais_publisher, daemon=True)
+        ais_thread.start()
+        self.threads.append(ais_thread)
         
     def stop_listening(self):
         """Stop listening"""
@@ -222,7 +248,7 @@ class MultiSourceNMEAParser(QObject):
             if source.socket:
                 try:
                     source.socket.close()
-                except:
+                except OSError:
                     pass
                     
         # Wait for threads
@@ -260,8 +286,7 @@ class MultiSourceNMEAParser(QObject):
                         sentence = sentence.strip()
                         if sentence:
                             self.parse_sentence(sentence, source)
-                            source.last_data_time = datetime.now()
-                            source.data_count += 1
+                            source.mark_data()
                             self.sentence_received.emit(source.name, sentence)
 
                 except socket.timeout:
@@ -356,8 +381,9 @@ class MultiSourceNMEAParser(QObject):
             return
 
         # Verify checksum if present
-        if '*' in sentence:
-            data, checksum = sentence[:-3], sentence[-2:]
+        star = sentence.rfind('*')
+        if star != -1:
+            data, checksum = sentence[:star], sentence[star + 1:star + 3]
             if not self.verify_checksum(data, checksum):
                 return
 
@@ -437,15 +463,16 @@ class MultiSourceNMEAParser(QObject):
             elif sid in ('GSA', 'GSV', 'TXT', 'ABK', 'ALR'):
                 pass  # satellite / text / alert info — no action needed
 
-        except Exception as e:
+        except Exception:
             source.error_count += 1
+            logger.debug("Failed to parse %r from %s", sentence, source.name, exc_info=True)
 
     def verify_checksum(self, data, checksum):
         """Verify NMEA checksum"""
         calc_checksum = 0
         for char in data[1:]:
             calc_checksum ^= ord(char)
-        return f"{calc_checksum:02X}" == checksum
+        return f"{calc_checksum:02X}" == checksum.upper()
 
     @staticmethod
     def _parse_gga_utc(time_str):
@@ -465,9 +492,16 @@ class MultiSourceNMEAParser(QObject):
         try:
             if 'GGA' in parts[0]:
                 # $GPGGA,HHMMSS.ss,lat,N/S,lon,E/W,qual,nsat,hdop,alt,M,geoid,M,age,stn*CS
+                # Fix quality 0 (or empty) = no fix.  Receivers keep sending
+                # GGA with empty position fields when the fix is lost; those
+                # must NOT be treated as a position (would move own ship to 0,0).
+                if len(parts) < 7 or parts[6] in ('', '0'):
+                    return
                 utc_seconds = self._parse_gga_utc(parts[1])
                 lat = self.parse_coordinate(parts[2], parts[3])
                 lon = self.parse_coordinate(parts[4], parts[5])
+                if lat is None or lon is None:
+                    return
 
                 if lat != self.latitude or lon != self.longitude:
                     self.latitude = lat
@@ -481,10 +515,12 @@ class MultiSourceNMEAParser(QObject):
 
             elif 'GLL' in parts[0]:
                 # $GPGLL,lat,N/S,lon,E/W,HHMMSS.ss,status,mode*CS
-                if len(parts) >= 7 and parts[6] in ('A', ''):
+                if len(parts) >= 7 and parts[6].split('*')[0] in ('A', ''):
                     # 'A' = data valid; some units omit status
                     lat = self.parse_coordinate(parts[1], parts[2])
                     lon = self.parse_coordinate(parts[3], parts[4])
+                    if lat is None or lon is None:
+                        return
                     if lat != self.latitude or lon != self.longitude:
                         self.latitude = lat
                         self.longitude = lon
@@ -498,9 +534,11 @@ class MultiSourceNMEAParser(QObject):
         Uses the direction indicator (N/S/E/W) to determine degree width:
           - N or S (latitude)  -> 2-digit degrees (DDMM.MMMM)
           - E or W (longitude) -> 3-digit degrees (DDDMM.MMMM)
+
+        Returns None when the field is empty or malformed (no fix).
         """
         if not coord_str or not direction:
-            return 0.0
+            return None
         try:
             if direction in ('N', 'S'):
                 degrees = int(coord_str[:2])
@@ -509,13 +547,13 @@ class MultiSourceNMEAParser(QObject):
                 degrees = int(coord_str[:3])
                 minutes = float(coord_str[3:])
             else:
-                return 0.0
+                return None
             decimal = degrees + minutes / 60.0
             if direction in ('S', 'W'):
                 decimal = -decimal
             return decimal
         except (ValueError, IndexError):
-            return 0.0
+            return None
         
     def parse_heading(self, parts, source):
         """Parse heading from HDT or HDG sentence."""
@@ -529,14 +567,28 @@ class MultiSourceNMEAParser(QObject):
                         self.heading_updated.emit(heading, source.name)
             elif 'HDG' in parts[0]:
                 # $HCHDG,heading,deviation,dev_dir,variation,var_dir*CS
+                # True = magnetic sensor heading + deviation + variation
                 if parts[1]:
                     heading = float(parts[1])
-                    # Apply magnetic variation if present to get true heading
+                    if len(parts) >= 4 and parts[2] and parts[3]:
+                        deviation = float(parts[2])
+                        heading += -deviation if parts[3].startswith('W') else deviation
+                    variation = None
                     if len(parts) >= 6 and parts[4] and parts[5]:
                         variation = float(parts[4])
-                        if parts[5] == 'W':
+                        if parts[5].startswith('W'):
                             variation = -variation
-                        heading = (heading + variation) % 360.0
+                    elif self.magnetic_variation is not None:
+                        variation = self.magnetic_variation   # from RMC
+                    if variation is None:
+                        if not self._warned_no_variation:
+                            logger.warning("HDG from %s has no magnetic variation and none "
+                                           "is available from RMC — heading is MAGNETIC, "
+                                           "not true", source.name)
+                            self._warned_no_variation = True
+                    else:
+                        heading += variation
+                    heading %= 360.0
                     if heading != self.heading:
                         self.heading = heading
                         self.heading_updated.emit(heading, source.name)
@@ -558,6 +610,7 @@ class MultiSourceNMEAParser(QObject):
             # Also extract COG if available
             if len(parts) >= 2 and parts[1]:
                 self.course = float(parts[1])
+                self.cog_updated.emit(self.course, self.speed_over_ground)
         except (IndexError, ValueError):
             pass
             
@@ -593,6 +646,8 @@ class MultiSourceNMEAParser(QObject):
             # Position
             lat = self.parse_coordinate(parts[3], parts[4])
             lon = self.parse_coordinate(parts[5], parts[6])
+            if lat is None or lon is None:
+                return
             if lat != self.latitude or lon != self.longitude:
                 self.latitude = lat
                 self.longitude = lon
@@ -607,6 +662,12 @@ class MultiSourceNMEAParser(QObject):
             # Course over ground (degrees true)
             if parts[8]:
                 self.course = float(parts[8])
+                self.cog_updated.emit(self.course, self.speed_over_ground)
+
+            # Magnetic variation (fields 10/11) — used to correct HDG headings
+            if len(parts) >= 12 and parts[10] and parts[11]:
+                var = float(parts[10])
+                self.magnetic_variation = -var if parts[11].startswith('W') else var
 
             self.position_updated.emit(self.latitude, self.longitude,
                                        self.speed, source.name)
@@ -827,8 +888,11 @@ class MultiSourceNMEAParser(QObject):
                 bits = _ais_decode_payload(dec_payload, dec_pad)
                 self._ais_dispatch(bits, source, encrypted, key_name)
             else:
-                # Multi-sentence — reassemble
-                key = seq_id or '_default'
+                # Multi-sentence — reassemble.  Key on source + channel +
+                # sequence id so interleaved messages can't be mixed, and
+                # require fragments in order so a lost middle fragment
+                # discards the message instead of decoding garbage.
+                key = (source.name, parts[4], seq_id or '_default')
                 if frag_num == 1:
                     self._ais_reassembly[key] = {
                         'count': frag_count,
@@ -838,6 +902,9 @@ class MultiSourceNMEAParser(QObject):
                     }
                 elif key in self._ais_reassembly:
                     buf = self._ais_reassembly[key]
+                    if frag_num != len(buf['payloads']) + 1 or frag_count != buf['count']:
+                        del self._ais_reassembly[key]      # missing / out-of-order fragment
+                        return
                     buf['payloads'].append(payload_str)
                     if frag_num == frag_count:
                         buf['pad'] = pad_bits
@@ -851,6 +918,7 @@ class MultiSourceNMEAParser(QObject):
                                            encrypted, key_name)
         except Exception:
             source.error_count += 1
+            logger.debug("AIS decode failed (%s)", source.name, exc_info=True)
 
     def _ais_dispatch(self, bits: list[int], source,
                        encrypted: bool = False, key_name: str = ''):
@@ -890,11 +958,22 @@ class MultiSourceNMEAParser(QObject):
         if abs(lon) > 180 or abs(lat) > 90:
             return
 
-        sog = sog_raw / 10.0 if sog_raw < 1023 else 0.0
-        cog = cog_raw / 10.0 if cog_raw < 3600 else 0.0
-        hdg = float(hdg_raw) if hdg_raw < 360 else cog
+        self._store_position_report(mmsi, lat, lon, sog_raw, cog_raw, hdg_raw,
+                                    'A', encrypted, key_name, nav_status=nav_status)
 
-        existing = self.ais_targets.get(mmsi, {})
+    # ITU-R M.1371 "not available" values
+    _SOG_NA = 1023
+    _COG_NA = 3600
+    _HDG_NA = 511
+
+    def _store_position_report(self, mmsi, lat, lon, sog_raw, cog_raw, hdg_raw,
+                               ais_class, encrypted, key_name, nav_status=15):
+        """Store a position report.  Unavailable SOG/COG/heading become None
+        (never 0, which would draw a false northbound vector and false CPA)."""
+        sog = sog_raw / 10.0 if sog_raw < self._SOG_NA else None
+        cog = cog_raw / 10.0 if cog_raw < self._COG_NA else None
+        hdg = float(hdg_raw) if hdg_raw < 360 else cog
+        static = self._ais_static.get(mmsi, {})
         self.ais_targets[mmsi] = {
             'mmsi': mmsi,
             'lat': lat,
@@ -903,14 +982,69 @@ class MultiSourceNMEAParser(QObject):
             'speed': sog,
             'heading': hdg,
             'nav_status': nav_status,
-            'name': existing.get('name', f'MMSI-{mmsi}'),
-            'ship_type': existing.get('ship_type', 0),
-            'call_sign': existing.get('call_sign', ''),
-            'class': 'A',
-            'encrypted': encrypted,
-            'decrypt_key': key_name,
+            'name': static.get('name') or f'MMSI-{mmsi}',
+            'ship_type': static.get('ship_type', 0),
+            'call_sign': static.get('call_sign', ''),
+            'destination': static.get('destination', ''),
+            'class': ais_class,
+            'encrypted': encrypted or static.get('encrypted', False),
+            'decrypt_key': key_name or static.get('decrypt_key', ''),
+            'rx_time': time.monotonic(),
         }
-        self.ais_updated.emit(list(self.ais_targets.values()))
+        self._ais_dirty = True
+
+    def _store_static(self, mmsi, encrypted, key_name, **fields):
+        """Store static/voyage data.  It is merged into the target when (or
+        if) a position report exists — static data alone never creates a
+        target, so no phantom targets appear at 0°N 0°E."""
+        static = self._ais_static.setdefault(mmsi, {})
+        static.update({k: v for k, v in fields.items() if v not in (None, '')})
+        if encrypted:
+            static['encrypted'] = True
+            static['decrypt_key'] = key_name
+        static['ts'] = time.monotonic()
+        tgt = self.ais_targets.get(mmsi)
+        if tgt is not None:
+            merged = dict(tgt)                     # copy: published dicts are never mutated
+            merged.update({k: v for k, v in static.items() if k != 'ts'})
+            self.ais_targets[mmsi] = merged
+            self._ais_dirty = True
+
+    def _ais_publisher(self):
+        """Prune lost AIS targets and publish changes at a bounded rate."""
+        while self.running:
+            time.sleep(self.AIS_PUBLISH_INTERVAL_S)
+            try:
+                self._publish_ais()
+            except Exception:
+                logger.exception("AIS publisher error")
+
+    def _publish_ais(self):
+        now = time.monotonic()
+        with self._ais_lock:
+            stale = [m for m, t in self.ais_targets.items()
+                     if now - t.get('rx_time', now) > self.AIS_TARGET_TIMEOUT_S]
+            for m in stale:
+                del self.ais_targets[m]
+            for m in [m for m, st in self._ais_static.items()
+                      if now - st.get('ts', now) > self.AIS_STATIC_TIMEOUT_S]:
+                del self._ais_static[m]
+            old_bs = [m for m, b in self.ais_base_stations.items()
+                      if now - b.get('rx_time', now) > self.AIS_BASE_STATION_TIMEOUT_S]
+            for m in old_bs:
+                del self.ais_base_stations[m]
+            emit_targets = self._ais_dirty or bool(stale)
+            emit_bases = self._base_dirty or bool(old_bs)
+            targets = list(self.ais_targets.values()) if emit_targets else None
+            bases = list(self.ais_base_stations.values()) if emit_bases else None
+            self._ais_dirty = self._base_dirty = False
+        if stale:
+            logger.info("AIS: %d target(s) lost (no report for %.0f s)",
+                        len(stale), self.AIS_TARGET_TIMEOUT_S)
+        if targets is not None:
+            self.ais_updated.emit(targets)
+        if bases is not None:
+            self.base_stations_updated.emit(bases)
 
     def _ais_msg_4(self, bits):
         """Base Station Report (type 4) — 168 bits.
@@ -945,8 +1079,9 @@ class MultiSourceNMEAParser(QObject):
             'lon': lon,
             'type': 'ais_base',
             'name': f'BASE-{mmsi}',
+            'rx_time': time.monotonic(),
         }
-        self.base_stations_updated.emit(list(self.ais_base_stations.values()))
+        self._base_dirty = True
 
     def _ais_msg_5(self, bits, encrypted=False, key_name=''):
         """Class A static / voyage data (type 5) — 424 bits."""
@@ -958,32 +1093,8 @@ class MultiSourceNMEAParser(QObject):
         call_sign = _ais_decode_text(bits, 70, 42)     # 7 chars
         destination = _ais_decode_text(bits, 302, 120)  # 20 chars
 
-        # Merge into existing target (position comes from msg 1/2/3)
-        if mmsi in self.ais_targets:
-            self.ais_targets[mmsi]['name'] = name
-            self.ais_targets[mmsi]['ship_type'] = ship_type
-            self.ais_targets[mmsi]['call_sign'] = call_sign
-            self.ais_targets[mmsi]['destination'] = destination
-            if encrypted:
-                self.ais_targets[mmsi]['encrypted'] = True
-                self.ais_targets[mmsi]['decrypt_key'] = key_name
-        else:
-            self.ais_targets[mmsi] = {
-                'mmsi': mmsi,
-                'lat': 0.0,
-                'lon': 0.0,
-                'course': 0.0,
-                'speed': 0.0,
-                'heading': 0.0,
-                'nav_status': 15,
-                'name': name,
-                'ship_type': ship_type,
-                'call_sign': call_sign,
-                'destination': destination,
-                'class': 'A',
-                'encrypted': encrypted,
-                'decrypt_key': key_name,
-            }
+        self._store_static(mmsi, encrypted, key_name, name=name, ship_type=ship_type,
+                           call_sign=call_sign, destination=destination)
 
     def _ais_msg_18(self, bits, encrypted=False, key_name=''):
         """Class B position report (type 18) — 168 bits."""
@@ -1002,28 +1113,8 @@ class MultiSourceNMEAParser(QObject):
         lat = lat_raw / 600000.0
         if abs(lon) > 180 or abs(lat) > 90:
             return
-
-        sog = sog_raw / 10.0 if sog_raw < 1023 else 0.0
-        cog = cog_raw / 10.0 if cog_raw < 3600 else 0.0
-        hdg = float(hdg_raw) if hdg_raw < 360 else cog
-
-        existing = self.ais_targets.get(mmsi, {})
-        self.ais_targets[mmsi] = {
-            'mmsi': mmsi,
-            'lat': lat,
-            'lon': lon,
-            'course': cog,
-            'speed': sog,
-            'heading': hdg,
-            'nav_status': 15,
-            'name': existing.get('name', f'MMSI-{mmsi}'),
-            'ship_type': existing.get('ship_type', 0),
-            'call_sign': existing.get('call_sign', ''),
-            'class': 'B',
-            'encrypted': encrypted,
-            'decrypt_key': key_name,
-        }
-        self.ais_updated.emit(list(self.ais_targets.values()))
+        self._store_position_report(mmsi, lat, lon, sog_raw, cog_raw, hdg_raw,
+                                    'B', encrypted, key_name)
 
     def _ais_msg_24(self, bits, encrypted=False, key_name=''):
         """Class B static data (type 24) — parts A and B."""
@@ -1031,33 +1122,15 @@ class MultiSourceNMEAParser(QObject):
             return
         mmsi = str(_ais_bits_to_uint(bits, 8, 30))
         part_num = _ais_bits_to_uint(bits, 38, 2)
-
         if part_num == 0:
             # Part A: ship name
-            name = _ais_decode_text(bits, 40, 120)
-            if mmsi in self.ais_targets:
-                self.ais_targets[mmsi]['name'] = name
-                if encrypted:
-                    self.ais_targets[mmsi]['encrypted'] = True
-                    self.ais_targets[mmsi]['decrypt_key'] = key_name
-            else:
-                self.ais_targets[mmsi] = {
-                    'mmsi': mmsi, 'lat': 0.0, 'lon': 0.0,
-                    'course': 0.0, 'speed': 0.0, 'heading': 0.0,
-                    'nav_status': 15, 'name': name,
-                    'ship_type': 0, 'call_sign': '', 'class': 'B',
-                    'encrypted': encrypted, 'decrypt_key': key_name,
-                }
+            self._store_static(mmsi, encrypted, key_name,
+                               name=_ais_decode_text(bits, 40, 120))
         elif part_num == 1:
             # Part B: call sign, ship type
-            call_sign = _ais_decode_text(bits, 40, 42)
-            ship_type = _ais_bits_to_uint(bits, 82, 8)
-            if mmsi in self.ais_targets:
-                self.ais_targets[mmsi]['call_sign'] = call_sign
-                self.ais_targets[mmsi]['ship_type'] = ship_type
-                if encrypted:
-                    self.ais_targets[mmsi]['encrypted'] = True
-                    self.ais_targets[mmsi]['decrypt_key'] = key_name
+            self._store_static(mmsi, encrypted, key_name,
+                               call_sign=_ais_decode_text(bits, 40, 42),
+                               ship_type=_ais_bits_to_uint(bits, 82, 8))
 
 
 # ======================================================================
