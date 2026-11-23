@@ -2,6 +2,10 @@
 
 Professional ARPA-compliant radar display and control application for maritime radar systems. Follows IMO Resolution A.823(19), IEC 62388, and SN.1/Circ.243/Rev.2 display conventions.
 
+![Radar GUI showing simulated radar video, ARPA and AIS targets, closest-CPA list, navigation data and alarms](docs/screenshot.png)
+
+*Day mode, North-Up, 6 NM range, running the built-in radar simulator with `test_nmea_sender.py` supplying GPS, heading, depth and AIS (including encrypted SA-AIS) data.*
+
 ## Features
 
 ### Display Modes (IMO Compliant)
